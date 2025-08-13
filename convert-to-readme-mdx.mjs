@@ -17,14 +17,6 @@ import remarkStringify from 'remark-stringify';
 import { visit } from 'unist-util-visit';
 
 /**
- * Usage examples:
- *   node convert-to-readme-mdx.mjs \
- *     --cwd "./customer-repo/docs" \
- *     --src . \
- *     --out "../readme-ready" \
- *     --dest-name content \
- *     --copy "../github-synced-project"
- *
  * Flags:
  *   --cwd           working directory to chdir into (optional)
  *   --src           source directory, relative to cwd (required unless --in-place)
@@ -133,7 +125,7 @@ const report = {
       const htmlToMdStrips = [];
       const imageUrls = [...preCollectedImages]; // seed with regex-found
       const jsRemoved = []; // JavaScript we strip (scripts, handlers)
-      const mdxRemoved = []; // MDX/JSX components that won’t survive
+      const mdxRemoved = []; // MDX/JSX components that *look like* components
 
       const toMarkdown = unified()
         // Parse markdown (+ GFM)
@@ -146,8 +138,8 @@ const report = {
         // Collect markdown images (mdast `image` nodes)
         .use(remarkCollectMarkdownImages, { images: imageUrls })
 
-        // Collect any MDX/JSX elements (so we can log them as removed)
-        .use(remarkCollectMdxComponents, { removed: mdxRemoved })
+        // Collect MDX/JSX elements (but only component-like ones; see plugin)
+        .use(remarkCollectMdxComponentsComponentLike, { removed: mdxRemoved })
 
         // Allow MDX syntax (we’ll still emit .md filenames)
         .use(remarkMdx)
@@ -169,7 +161,7 @@ const report = {
         // Sanitize disallowed JS and *record* what we strip
         .use(rehypeDisallowAndReplaceJS, { warnings, jsRemoved })
 
-        // Convert HTML → Markdown AST (headings, strong/em, lists, paras, hr/br)
+        // Convert HTML → Markdown AST
         .use(rehypeRemark, {
           handlers: {
             br() {
@@ -178,7 +170,6 @@ const report = {
             hr() {
               return { type: 'thematicBreak' };
             },
-            // Ensure <b> maps to strong (some HTML uses <b>)
             b(h, node) {
               return h(node, 'strong', { children: allTextChildren(node) });
             },
@@ -200,15 +191,23 @@ const report = {
       let mdxBody = String(vf);
 
       // 4.5) Strip top-of-body import statements; record as removed code
-      const importRegex = /^(?:\s*import\s.+\n)+/; // strictly at top
-      const importMatches = mdxBody.match(importRegex) || [];
+      const importRegex = /^(?:\s*import\s.+\n)+/;
+      const importMatchesStr = (mdxBody.match(importRegex) || [''])[0];
       mdxBody = mdxBody.replace(importRegex, '');
-      if (importMatches.length) {
-        await appendToLog('REMOVED_IMPORTS', rel, '', importMatches, []);
+      if (importMatchesStr && importMatchesStr.trim()) {
+        // Only log imports as "removed code"
+        await appendToLog(
+          'REMOVED_IMPORTS',
+          rel,
+          '',
+          [importMatchesStr.trim()],
+          []
+        );
       }
 
       // Log any residual HTML that had to be stripped to plaintext
       if (htmlToMdStrips.length) {
+        // Goes into Error Message, not Removed Code
         await appendToLog(
           'STRIPPED_HTML',
           rel,
@@ -223,7 +222,7 @@ const report = {
         await appendToLog('REMOVED_JS', rel, '', jsRemoved, []);
       }
 
-      // Log any MDX/JSX components we saw (treated as "removed")
+      // Log any MDX/JSX components we saw (only component-like, see plugin)
       if (mdxRemoved.length) {
         await appendToLog('REMOVED_MDX', rel, '', mdxRemoved, []);
       }
@@ -244,7 +243,7 @@ const report = {
       await fs.mkdir(path.dirname(outAbs), { recursive: true });
       await fs.writeFile(outAbs, final, 'utf8');
 
-      // 7) Optional copy destination (e.g., your GitHub-synced project)
+      // 7) Optional copy destination
       if (COPY_DIR) {
         const copyAbs = path.join(COPY_DIR, outRel);
         await fs.mkdir(path.dirname(copyAbs), { recursive: true });
@@ -277,7 +276,7 @@ const report = {
         [],
         []
       );
-      continue; // proceed to next file
+      continue;
     }
   }
 
@@ -407,15 +406,17 @@ function remarkCollectMarkdownImages({ images = [] } = {}) {
   };
 }
 
-// Collect MDX/JSX elements so we can report them as "removed"
-function remarkCollectMdxComponents({ removed = [] } = {}) {
+// Collect MDX/JSX elements but only if they *look like* components
+// i.e., tag name starts with an uppercase letter (Accordion, Link, Tabs, etc.)
+function remarkCollectMdxComponentsComponentLike({ removed = [] } = {}) {
   return tree => {
     visit(tree, node => {
       if (
         node.type === 'mdxJsxFlowElement' ||
         node.type === 'mdxJsxTextElement'
       ) {
-        const name = node.name || '<unnamed>';
+        const name = node.name || '';
+        if (!/^[A-Z]/.test(name)) return; // skip lowercase 'div', 'span', etc.
         const attrs = (node.attributes || [])
           .map(a => {
             if (!a || !a.name) return '';
@@ -461,14 +462,11 @@ function rehypeFlattenLinksToText() {
     visit(tree, (node, index, parent) => {
       if (!parent || index == null) return;
 
-      // HTML <a>
       if (node.type === 'element' && node.tagName === 'a') {
         const kids = node.children || [];
         parent.children.splice(index, 1, ...kids);
         return;
       }
-
-      // MDX JSX <Link> … </Link> or <Link />
       if (
         (node.type === 'mdxJsxFlowElement' ||
           node.type === 'mdxJsxTextElement') &&
@@ -499,7 +497,6 @@ function rehypeCollectImgSources({ images = [] } = {}) {
           if (m && m[2]) images.push(m[2].trim());
         }
       }
-      // Also catch MDX JSX elements like <Image src={useBaseUrl("...")} />
       if (
         (node && node.type === 'mdxJsxFlowElement') ||
         (node && node.type === 'mdxJsxTextElement')
@@ -527,7 +524,6 @@ function rehypeCollectImgSources({ images = [] } = {}) {
 }
 
 // Strip/replace disallowed JS and warn on risky embeds (hast stage)
-// Also RECORD what was removed into jsRemoved[]
 function rehypeDisallowAndReplaceJS({ warnings = [], jsRemoved = [] } = {}) {
   return tree => {
     visit(tree, node => {
@@ -543,11 +539,10 @@ function rehypeDisallowAndReplaceJS({ warnings = [], jsRemoved = [] } = {}) {
             ? `Removed <script src="${node.properties.src}"> (not allowed in ReadMe docs)`
             : 'Removed inline <script> (not allowed in ReadMe docs)',
         });
+        // Replace with a note (kept minimal, not logged as HTML "removed code")
         node.type = 'raw';
-        node.value = [
-          '\n{/* ❗ Script removed: replace with an MDX component. */}\n',
-          jsCode ? '```js\n' + jsCode + '\n```\n' : '',
-        ].join('');
+        node.value =
+          '\n{/* ❗ Script removed: replace with an MDX component. */}\n';
         node.tagName = undefined;
         node.children = undefined;
         node.properties = undefined;
@@ -604,8 +599,6 @@ function extractText(node) {
   }
   return out;
 }
-
-// helper to build strong node children for <b>
 function allTextChildren(node) {
   const children = [];
   (node.children || []).forEach(c => {
@@ -693,6 +686,12 @@ async function writeLogHeader(logPath) {
   const header = `Type,File,Error Message,Removed Code,Missing Images\n`;
   await fs.writeFile(logPath, header, 'utf8');
 }
+
+/**
+ * Append a row to _log.csv
+ * - Only records "Removed Code" that is JS/imports/MDX-components (component-like).
+ * - Generic HTML is *not* included in Removed Code (it goes to STRIPPED_HTML/Error Message).
+ */
 async function appendToLog(
   type,
   file,
@@ -706,14 +705,37 @@ async function appendToLog(
     if (/[",\n]/.test(s)) s = `"${s}"`;
     return s;
   };
-  const removed = Array.isArray(removedCodeArr)
-    ? removedCodeArr.join('\n---\n')
-    : '';
+
+  // Filter removed code to only JS/imports/MDX-component-like
+  const filteredRemoved = (Array.isArray(removedCodeArr) ? removedCodeArr : [])
+    .filter(snippet => {
+      if (!snippet) return false;
+      const s = String(snippet).trim();
+
+      // Imports
+      if (
+        /^\s*import\s.+from\s+['"].+['"];?\s*$/m.test(s) ||
+        /^\s*import\s*[{*].+['"]\s*;?\s*$/m.test(s)
+      ) {
+        return true;
+      }
+      // Script markers or inline handler summaries we generate
+      if (/^SCRIPT (SRC|INLINE CODE)/.test(s) || /^INLINE HANDLERS/.test(s)) {
+        return true;
+      }
+      // MDX component-like tags: starts with '<' + Uppercase tag
+      if (/^<\s*[A-Z][A-Za-z0-9]*/.test(s)) {
+        return true;
+      }
+      return false; // drop everything else (likely generic HTML)
+    })
+    .join('\n---\n');
+
   const imgs = Array.isArray(missingImagesArr)
     ? missingImagesArr.join('\n')
     : '';
   const row = `${safe(type)},${safe(file)},${safe(errorMsg)},${safe(
-    removed
+    filteredRemoved
   )},${safe(imgs)}\n`;
   await fs.appendFile(LOG_PATH, row, 'utf8');
 }
