@@ -1,0 +1,33 @@
+{
+  "name": "readme-mdx-migrator",
+  "version": "1.0.0",
+  "type": "module",
+  "bin": {
+    "readme-mdx-migrator": "convert-to-readme-mdx.mjs"
+  },
+  "dependencies": {
+    "globby": "^14.1.0",
+    "gray-matter": "^4.0.3",
+    "js-yaml": "^4.1.0",
+    "picocolors": "^1.1.1",
+    "rehype-raw": "^7.0.0",
+    "rehype-remark": "^10.0.1",
+    "rehype-stringify": "^10.0.0",
+    "remark-frontmatter": "^5.0.0",
+    "remark-gfm": "^4.0.1",
+    "remark-mdx": "^3.1.0",
+    "remark-parse": "^11.0.0",
+    "remark-rehype": "^11.1.2",
+    "remark-stringify": "^11.0.0",
+    "unified": "^11.0.5",
+    "unist-util-visit": "^5.0.0"
+  },
+  "main": "convert-to-readme-mdx.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": ""
+}
