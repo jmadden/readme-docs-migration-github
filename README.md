@@ -1,4 +1,4 @@
-# MD Migration Tool
+# Docs Migration Tool - GitHub Sync to ReadMe
 
 This tool is designed to help migrate Markdown documentation from a customer’s local directory into a ReadMe-compatible Markdown (MDX) format, while performing necessary cleanup, HTML-to-Markdown conversion, and generating logs of issues encountered during the process.
 
