@@ -1,150 +1,155 @@
-# Markdown → ReadMe Migration Tool
+# MD to ReadMe Migration Tool
 
-This Node.js script automates migrating a customer’s Markdown docs into a ReadMe‑compatible format. It converts embedded HTML to Markdown, normalizes frontmatter, strips unsupported code (JavaScript/MDX), logs all changes, ensures each target directory has an `index.md`, and (optionally) refreshes `_order.yaml` when present.
+This tool automates the migration of customer Markdown documentation into a ReadMe-compatible format.
+
+It is designed for cases where:
+
+- Customer files may contain **HTML**, **JavaScript**, or **React/MDX components** that must be removed or converted.
+- Customer frontmatter differs from ReadMe's frontmatter format.
+- HTML must be converted to clean, semantic Markdown.
+- Image references and missing assets must be logged for follow-up.
+- A `_order.yaml` file may need updating to reflect migrated file/folder structure.
+- A placeholder `index.md` may need to be generated.
 
 ---
 
 ## Features
 
-- **Non‑recursive processing**: operates only on files directly inside the `--src` folder.
-- **Inputs**: `.md` by default; add `--include-mdx` to also accept `.mdx` in the same folder.
-- **Outputs**: always writes `.md` files (ReadMe wants `.md`, not `.mdx`).
-- **Frontmatter mapping**:
-  - Builds ReadMe frontmatter like:
-    ```yaml
-    ---
-    title: Title Here
-    deprecated: false
-    hidden: false
-    metadata:
-      robots: index
-    ---
-    ```
-  - Title source preference: customer frontmatter (`sidebar_label` → `title`) → first `# Heading` → fallback from filename (Title Case).
-- **HTML → Markdown conversion** (headings, lists, emphasis, breaks, etc.).
-- **Unsafe code removal**:
-  - Strips `<script>` tags (inline code and external `src`).
-  - Removes inline DOM event handlers (e.g., `onClick`, `onLoad`).
-  - Removes top‑of‑file `import …` lines.
-  - Detects MDX/JSX components and records them.
-- **Comprehensive audit log**: `_log.csv` with columns:
-  - `Type` (e.g., `IMAGES`, `REMOVED_JS`, `REMOVED_IMPORTS`, `REMOVED_MDX`, `STRIPPED_HTML`, `FAILED`, `FATAL`)
-  - `File`
-  - `Error Message`
-  - `Removed Code` (removed imports, JS, handlers, and MDX/JSX components)
-  - `Missing Images` (newline‑separated list; includes values from expressions like `useBaseUrl("/img/…")`)
-- **Image URL discovery**:
-  - Markdown images `![alt](url)`
-  - HTML `<img src="…">`
-  - JSX `src={useBaseUrl("…")}` and `useBaseUrl("…")` anywhere in text
-- **`index.md` auto‑creation**:
-  - If missing in the output directory, creates `index.md` using the title from the first `.md` file (frontmatter `title` → first `#` → Title‑Case filename).
-- **`_order.yaml` updater** (idempotent, optional):
-  - If `_order.yaml` exists in the output directory, rewrites it to list **immediate subfolders** and **`.md` files** (excluding `index.md`) as slugs:
-    ```
-    - how-to-api
-    - instructions
-    - workflows
-    ```
-  - Rules: lowercase; spaces → dashes; one item per line prefixed with `- `.
-- **Error‑tolerant**: logs failures but continues to the next file.
+1. **Frontmatter Conversion**
+
+   - Transforms customer frontmatter into ReadMe frontmatter:
+     ```yaml
+     ---
+     title: Example Title
+     deprecated: false
+     hidden: false
+     metadata:
+       robots: index
+     ---
+     ```
+
+2. **HTML → Markdown Conversion**
+
+   - Converts `<h1>` to `#`, `<h2>` to `##`, `<h3>` to `###`, `<ul>` to `- list`, `<strong>` to `**bold**`, `<p>` to new lines, etc.
+
+3. **JavaScript & MDX Component Removal**
+
+   - Removes embedded scripts/components.
+   - Logs removed code in `_log.csv`.
+
+4. **Import Statement Removal**
+
+   - Removes all top-of-file `import` statements.
+   - Logs removed imports.
+
+5. **Image Logging**
+
+   - Detects image URLs in Markdown or MDX syntax.
+   - Logs missing image references in `_log.csv` for follow-up.
+
+6. **Graceful Error Handling**
+
+   - If a file fails conversion, logs the issue in `_log.csv` and continues.
+
+7. **Directory Management**
+
+   - Can create the destination directory if it does not exist.
+   - Only processes `.md` files (no recursion into subdirectories unless specified).
+
+8. **\_order.yaml Update**
+
+   - If `_order.yaml` exists in the destination folder, updates it to reflect the new files/folders.
+   - Converts spaces to dashes, lowercases names.
+
+9. **index.md Auto-Creation**
+
+   - If missing, creates `index.md` with title based on the **parent directory name** exactly as written.
+
+10. **Logging**
+    - Generates `_log.csv` with columns:
+      - **Type** – Error, Missing Images, Removed JS, Removed Imports.
+      - **File** – Full file path.
+      - **Error Message** – If applicable.
+      - **Missing Images** – Comma-separated list of missing images.
+      - **Removed Code** – Code snippets removed.
 
 ---
 
 ## Requirements
 
-- **Node.js** ≥ 18
-- **npm** (bundled with Node)
-- Access to:
-  - The customer docs folder
-  - Your GitHub‑synced ReadMe docs folder
+- **Node.js** v16+
+- **npm** or **yarn** installed
 
 ---
 
 ## Installation
 
-1. Clone or download the script into a working directory, for example:
+1. Clone or download this script into a working directory, for example:
 
    ```bash
-   mkdir ~/Tools/md-migration-tool
-   cd ~/Tools/md-migration-tool
+   mkdir /path/to/md-migration-tool
+   cd /path/to/md-migration-tool
    ```
 
-2. Save the script as convert-to-readme-mdx.mjs in that folder.
+2. Install dependencies (if any are needed for HTML → Markdown conversion):
 
-3. Install dependencies:
+   ```bash
+   npm install
+   ```
 
-```bash
-npm install
-```
+3. Make sure your source (customer docs) and destination (ReadMe repo) folders are ready.
 
-4. (Optional) Make it executable:
-
-```bash
-chmod +x convert-to-readme-mdx.mjs
-```
+---
 
 ## Usage
 
-### Command
-
 ```bash
-node convert-to-readme-mdx.mjs \
-  --cwd "<base-customer-docs-dir>" \
-  --src "<relative-path-to-source-folder>" \
-  --out "<absolute-output-folder>" \
-  [--dest-name "<subdir-name>"] \
-  [--copy "<second-output-folder>"] \
-  [--config "<path/to/config.json>"] \
-  [--include-mdx] \
-  [--in-place]
+node convert-to-readme-mdx.mjs <source-directory> <destination-directory>
 ```
-
-### Flags
-
-- --cwd
-
-Directory to chdir into before running (useful when providing a relative --src).
-
-- --src
-
-Source folder **relative to --cwd** containing .md (and optionally .mdx) files.
-**Non‑recursive**: only processes files directly inside this folder.
-
-- --out
-
-Absolute path to the primary output directory. Created if it doesn’t exist.
-
-- --dest-name
-
-Optional subdirectory name to create under --out (and --copy if used).
-
-- --copy
-
-Optional second destination to also write converted files to.
-
-- --config
-
-Optional JSON config file to tweak defaults (e.g., component replacement rules).
-
-- --include-mdx
-
-When present, also processes .mdx files in the same (non‑recursive) folder.
-
-- --in-place
-
-Write the converted files back into --src. (Use with caution.)
 
 ### Example
 
-**Customer docs:**
+**Customer docs (source directory):**
 
 ```bash
-/Users/jim/Customer Projects/Socure/devhub-v2-feature-docs-3225-create-doc-structure-effectiv/docs/workflow/quick-start/workflow-steps
+/path/to/customer/docs/workflow/quick-start/workflow-steps
 ```
 
-**ReadMe repo:**
+**ReadMe repo (destination directory):**
 
 ```bash
-/Users/jim/Customer Projects/Socure/docs_readme/docs/Workflows/quick-start
+/path/to/readme/repo/docs/Workflows/quick-start
 ```
+
+Run the script:
+
+```bash
+node convert-to-readme-mdx.mjs "/path/to/customer/docs/workflow/quick-start/workflow-steps" "/path/to/readme/repo/docs/Workflows/quick-start"
+```
+
+---
+
+## Output
+
+1. Migrated `.md` files in destination directory.
+2. `_log.csv` summarizing:
+   - Errors
+   - Missing images
+   - Removed JavaScript/MDX components
+   - Removed imports
+3. `_order.yaml` updated (if exists).
+4. `index.md` created if missing.
+
+---
+
+## Notes
+
+- If a file contains unsupported JavaScript or MDX, it will be removed from the output and logged.
+- HTML is converted to Markdown using rules that preserve semantic meaning and readability.
+- The `_log.csv` can be safely `.gitignore`'d to avoid committing migration logs to your repo.
+
+---
+
+## License
+
+MIT License
