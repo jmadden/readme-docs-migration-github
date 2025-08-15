@@ -125,3 +125,44 @@ This will:
 
 - Only `.md` files in the specified directory are processed — subdirectories are ignored unless explicitly passed via `--src`.
 - The `_log.csv` file is created in the output directory for review and can be ignored in Git by adding it to `.gitignore`.
+
+---
+
+## Utility Tools
+
+### Merge Logs Tool
+
+The `merge-logs.mjs` script is a utility for combining multiple `_log.csv` files generated during migration into a single consolidated CSV file. This is useful when you've run migrations across multiple directories and want to review all issues in one place.
+
+#### Usage
+
+```bash
+node merge-logs.mjs --root "/path/to/root" [--out "/path/to/output.csv"]
+```
+
+#### Parameters
+
+| Parameter | Required | Description                                                 |
+| --------- | -------- | ----------------------------------------------------------- |
+| `--root`  | Yes      | The root directory to recursively scan for `_log.csv` files |
+| `--out`   | No       | Output file path (defaults to `<root>/_log.all.csv`)        |
+
+#### Behavior
+
+- Recursively scans the specified root directory for files named `_log.csv`
+- Skips each file's header row so the final output has a single header
+- Creates the output directory if needed
+- Skips hidden folders and `node_modules` directories
+- Combines all log entries into one CSV file for easier review
+
+#### Example
+
+```bash
+# Merge all _log.csv files under a project directory
+node merge-logs.mjs --root "/path/to/project/docs"
+
+# Specify custom output location
+node merge-logs.mjs --root "/path/to/project/docs" --out "/path/to/combined-logs.csv"
+```
+
+This will create a single CSV file containing all the migration logs from subdirectories, making it easier to review and address any issues across the entire migration.
