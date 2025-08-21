@@ -1,4 +1,23 @@
 #!/usr/bin/env node
+/**
+ * Recursive MD → ReadMe-ready Markdown converter with:
+ *  - Frontmatter mapping to ReadMe's FM
+ *  - Robust :::note / :::tip → <Callout> pre-pass
+ *  - MD-only pipeline (no rehype) so JSX & HTML tables survive
+ *  - <ImageZoom> → **MISSING IMAGE!** /path
+ *  - Tabs (Docusaurus) → Tabs/Tab post-process (textual)
+ *  - Strip <script> and inline handlers (onClick, etc.) from raw HTML blocks; log removals
+ *  - Single consolidated _log.csv + migration-report.json at destination root
+ *  - index.md creation & _order.yaml update (if present) across all created folders
+ *
+ * Usage:
+ *   node convert-to-readme-mdx.mjs \
+ *     --cwd "/path/to/src-root" \
+ *     --src . \
+ *     --out "/path/to/dest-root" \
+ *     [--include-mdx] [--copy "/optional/second/dest"]
+ */
+
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import matter from 'gray-matter';
@@ -10,311 +29,241 @@ import remarkParse from 'remark-parse';
 import remarkGfm from 'remark-gfm';
 import remarkMdx from 'remark-mdx';
 import remarkFrontmatter from 'remark-frontmatter';
-import remarkRehype from 'remark-rehype';
-import rehypeRaw from 'rehype-raw';
-import rehypeRemark from 'rehype-remark';
 import remarkStringify from 'remark-stringify';
 import { visit } from 'unist-util-visit';
 
-/**
- * Flags:
- *   --cwd           working directory to chdir into (optional)
- *   --src           source directory, relative to cwd (required unless --in-place)
- *   --out           output base directory (required unless --in-place)
- *   --dest-name     subdirectory under --out (and --copy) to write into (optional)
- *   --copy          also copy converted files to this directory (optional)
- *   --config        path to JSON config (optional)
- *   --include-mdx   also process .mdx files in the SAME folder (non-recursive)
- *   --in-place      write back into --src (dangerous; not recommended)
- */
+/* ---------------- CLI + paths ---------------- */
 
 const rawArgs = parseArgs(process.argv.slice(2));
-if (rawArgs.cwd) {
-  process.chdir(path.resolve(rawArgs.cwd));
-  console.log(pc.gray(`cwd => ${process.cwd()}`));
+if (!rawArgs.cwd) {
+  console.error(pc.red('Error: --cwd is required (root directory to scan).'));
+  process.exit(1);
 }
+process.chdir(path.resolve(rawArgs.cwd));
+console.log(pc.gray(`cwd => ${process.cwd()}`));
+
 const args = rawArgs;
-
-if (!args.src && !args['in-place']) {
-  console.error(pc.red('Error: --src is required unless you use --in-place.'));
+if (!args.src) {
+  console.error(
+    pc.red('Error: --src is required (starting folder, relative to --cwd).')
+  );
   process.exit(1);
 }
-if (!args.out && !args['in-place']) {
-  console.error(pc.red('Error: --out is required unless you use --in-place.'));
+if (!args.out) {
+  console.error(pc.red('Error: --out is required (destination root).'));
   process.exit(1);
 }
 
-const SRC_DIR = path.resolve(args.src || '.');
-const OUT_BASE = args['in-place'] ? SRC_DIR : path.resolve(args.out);
-const DEST_DIR_NAME = args['dest-name'] ? sanitizeDir(args['dest-name']) : null;
-const OUT_DIR = DEST_DIR_NAME ? path.join(OUT_BASE, DEST_DIR_NAME) : OUT_BASE;
+const SRC_ROOT = path.resolve(args.src);
+const DEST_ROOT = path.resolve(args.out);
+const COPY_ROOT = args.copy ? path.resolve(args.copy) : null;
+const INCLUDE_MDX = !!args['include-mdx'];
 
-const COPY_BASE = args.copy ? path.resolve(args.copy) : null;
-const COPY_DIR = COPY_BASE
-  ? DEST_DIR_NAME
-    ? path.join(COPY_BASE, DEST_DIR_NAME)
-    : COPY_BASE
-  : null;
+await fs.mkdir(DEST_ROOT, { recursive: true });
+if (COPY_ROOT) await fs.mkdir(COPY_ROOT, { recursive: true });
 
-const CONFIG = await loadConfig(args.config);
-
-// CSV log lives alongside output
-const LOG_PATH = path.join(OUT_DIR, '_log.csv');
+const LOG_PATH = path.join(DEST_ROOT, '_log.csv');
+await writeLogHeader(LOG_PATH);
+const REPORT_PATH = path.join(DEST_ROOT, 'migration-report.json');
 
 const report = {
   startedAt: new Date().toISOString(),
   cwd: process.cwd(),
-  src: SRC_DIR,
-  out: OUT_DIR,
-  copy: COPY_DIR,
-  destName: DEST_DIR_NAME,
+  srcRoot: SRC_ROOT,
+  destRoot: DEST_ROOT,
+  copyRoot: COPY_ROOT,
   files: [],
 };
 
-(async () => {
-  // NON-RECURSIVE: only files directly in SRC_DIR
-  const includeMdx = !!args['include-mdx'];
-  const dirents = await fs.readdir(SRC_DIR, { withFileTypes: true });
-  const files = dirents
-    .filter(d => d.isFile())
-    .map(d => d.name)
-    .filter(name => {
-      const n = name.toLowerCase();
-      return n.endsWith('.md') || (includeMdx && n.endsWith('.mdx'));
-    });
+/* ---------------- discover files ---------------- */
 
-  if (!files.length) {
-    console.log(
-      pc.yellow(
-        'No .md files found in source (use --include-mdx to include .mdx).'
-      )
-    );
-    process.exit(0);
-  }
+const allFiles = await findMarkdownFilesRecursive(SRC_ROOT, {
+  includeMdx: INCLUDE_MDX,
+});
+if (!allFiles.length) {
+  console.log(
+    pc.yellow('No .md files found (use --include-mdx to include .mdx).')
+  );
+  process.exit(0);
+}
 
-  // ensure output destinations exist
-  await fs.mkdir(OUT_DIR, { recursive: true });
-  if (COPY_DIR) await fs.mkdir(COPY_DIR, { recursive: true });
+let failed = 0;
 
-  // reset _log.csv at start
-  await writeLogHeader(LOG_PATH);
+/* ---------------- main loop ---------------- */
 
-  let failedCount = 0;
+for (const absSrc of allFiles) {
+  const rel = path.relative(SRC_ROOT, absSrc);
+  const destAbs = path.join(DEST_ROOT, rel.replace(/\.(md|mdx)$/i, '.md'));
+  const copyAbs = COPY_ROOT
+    ? path.join(COPY_ROOT, rel.replace(/\.(md|mdx)$/i, '.md'))
+    : null;
 
-  for (const rel of files) {
-    try {
-      const abs = path.join(SRC_DIR, rel);
-      const raw = await fs.readFile(abs, 'utf8');
+  try {
+    const raw = await fs.readFile(absSrc, 'utf8');
 
-      // 0) Collect image URLs directly from source text (regex sweep)
-      const preCollectedImages = collectInlineImageUrlsFromText(raw);
+    // Pre-pass: :::note / :::tip → <Callout>
+    const preCallouts = convertNoteTipBlocks(raw);
 
-      // 1) Parse frontmatter
-      const fm = matter(raw);
-      const customerFM = fm.data ?? {};
-      const content = fm.content ?? '';
+    // Parse frontmatter
+    const fm = matter(preCallouts);
+    const customerFM = fm.data ?? {};
+    const content = fm.content ?? '';
 
-      // 2) Title
-      const title = deriveTitle(customerFM, content, CONFIG);
+    // Derive title
+    const title =
+      customerFM.sidebar_label ||
+      customerFM.title ||
+      content.match(/^\s*#\s+(.+?)\s*$/m)?.[1]?.trim() ||
+      'Untitled';
 
-      // 3) ReadMe FM
-      const readmeFM = buildReadmeFM(customerFM, title, CONFIG);
+    // Build ReadMe frontmatter
+    const readmeFM = buildReadmeFM(customerFM, title);
+    const readmeYaml = yaml.dump(readmeFM, { lineWidth: 0 });
 
-      // 4) Transform → sanitize, collect images, convert HTML → Markdown
-      const warnings = [];
-      const htmlToMdStrips = [];
-      const imageUrls = [...preCollectedImages]; // seed with regex-found
-      const jsRemoved = []; // JavaScript we strip (scripts, handlers)
-      const mdxRemoved = []; // MDX/JSX components that *look like* components
+    // Trackers
+    const warnings = [];
+    const strippedHtmlSnippets = [];
+    const imageUrls = collectInlineImageUrlsFromText(content);
+    const jsRemoved = [];
+    const mdxRemoved = [];
 
-      const toMarkdown = unified()
-        // Parse markdown (+ GFM)
-        .use(remarkParse)
-        .use(remarkGfm)
+    // MD-only transformation pipeline
+    const vf = await unified()
+      .use(remarkParse)
+      .use(remarkGfm)
+      .use(remarkMdx)
+      .use(remarkFrontmatter, ['yaml'])
 
-        // Fix MDX-unsafe comments/bang tags in mdast
-        .use(mdFixBangAndHtmlComments)
+      // Handle <ImageZoom> in mdast (replace with "MISSING IMAGE!")
+      .use(remarkReplaceImageZoom, { imageUrls })
 
-        // Collect markdown images (mdast `image` nodes)
-        .use(remarkCollectMarkdownImages, { images: imageUrls })
+      // Collect markdown images
+      .use(remarkCollectMarkdownImages, { images: imageUrls })
 
-        // Collect MDX/JSX elements (but only component-like ones; see plugin)
-        .use(remarkCollectMdxComponentsComponentLike, { removed: mdxRemoved })
+      // Record MDX components that look like components (Uppercase) — for logging only
+      .use(remarkCollectMdxComponentsComponentLike, { removed: mdxRemoved })
 
-        // Allow MDX syntax (we’ll still emit .md filenames)
-        .use(remarkMdx)
-        .use(remarkFrontmatter, ['yaml'])
+      // Fix MDX-unsafe HTML comments / <!…>
+      .use(mdFixBangAndHtmlComments)
 
-        // Move to HTML (hast), allow raw HTML
-        .use(remarkRehype, { allowDangerousHtml: true })
-        .use(rehypeRaw)
+      // Strip <script>…</script> and inline handlers in html nodes; log removals
+      .use(remarkStripScriptsAndHandlers, { jsRemoved, warnings })
 
-        // Unwrap neutral containers so inner headings/lists convert cleanly
-        .use(rehypeUnwrapNeutralContainers)
+      // Convert only a safe subset of HTML → Markdown; keep tables & JSX intact
+      .use(remarkConvertSelectedHtmlToMd, {
+        keepHtmlIf: rawHtml => {
+          return (
+            /<\s*(table|thead|tbody|tr|th|td)\b/i.test(rawHtml) ||
+            /<\s*(Tabs|Tab|Callout)\b/.test(rawHtml) ||
+            /<\s*[A-Z][A-Za-z0-9]*/.test(rawHtml)
+          ); // any Capitalized JSX component
+        },
+        recordRaw: raw => strippedHtmlSnippets.push(raw.trim()),
+      })
 
-        // Flatten links (HTML <a> and React <Link>) to plain text
-        .use(rehypeFlattenLinksToText)
+      // Stringify (no HAST round-trip)
+      .use(remarkStringify, {
+        bullet: '-',
+        fences: true,
+        listItemIndent: 'one',
+        rule: '-',
+      })
+      .process(content);
 
-        // Collect <img> sources and src={useBaseUrl("...")} from HTML/JSX
-        .use(rehypeCollectImgSources, { images: imageUrls })
+    let mdBody = String(vf);
 
-        // Sanitize disallowed JS and *record* what we strip
-        .use(rehypeDisallowAndReplaceJS, { warnings, jsRemoved })
+    // Post-process: transform Docusaurus Tabs to target Tabs/Tab
+    mdBody = transformDocusaurusTabsToTarget(mdBody);
 
-        // Convert HTML → Markdown AST
-        .use(rehypeRemark, {
-          handlers: {
-            br() {
-              return { type: 'break' };
-            },
-            hr() {
-              return { type: 'thematicBreak' };
-            },
-            b(h, node) {
-              return h(node, 'strong', { children: allTextChildren(node) });
-            },
-          },
-        })
-
-        // Strip any residual HTML nodes that couldn’t be bridged
-        .use(remarkRemoveResidualHtml, { strips: htmlToMdStrips })
-
-        // Stringify back to Markdown
-        .use(remarkStringify, {
-          bullet: '-',
-          fences: true,
-          listItemIndent: 'one',
-          rule: '-',
-        });
-
-      const vf = await toMarkdown.process(content);
-      let mdxBody = String(vf);
-
-      // 4.5) Strip top-of-body import statements; record as removed code
+    // Strip top-of-body import statements (log)
+    {
       const importRegex = /^(?:\s*import\s.+\n)+/;
-      const importMatchesStr = (mdxBody.match(importRegex) || [''])[0];
-      mdxBody = mdxBody.replace(importRegex, '');
-      if (importMatchesStr && importMatchesStr.trim()) {
-        // Only log imports as "removed code"
-        await appendToLog(
-          'REMOVED_IMPORTS',
-          rel,
-          '',
-          [importMatchesStr.trim()],
-          []
-        );
+      const m = (mdBody.match(importRegex) || [''])[0];
+      mdBody = mdBody.replace(importRegex, '');
+      if (m && m.trim()) {
+        await appendToLog(LOG_PATH, 'REMOVED_IMPORTS', rel, '', [m.trim()], []);
       }
+    }
 
-      // Log any residual HTML that had to be stripped to plaintext
-      if (htmlToMdStrips.length) {
-        // Goes into Error Message, not Removed Code
-        await appendToLog(
-          'STRIPPED_HTML',
-          rel,
-          htmlToMdStrips.join('\n---\n'),
-          [],
-          []
-        );
-      }
-
-      // Log any *removed JS* (scripts + inline handlers)
-      if (jsRemoved.length) {
-        await appendToLog('REMOVED_JS', rel, '', jsRemoved, []);
-      }
-
-      // Log any MDX/JSX components we saw (only component-like, see plugin)
-      if (mdxRemoved.length) {
-        await appendToLog('REMOVED_MDX', rel, '', mdxRemoved, []);
-      }
-
-      // Log any images found (dedup)
-      const uniqueImages = Array.from(new Set(imageUrls)).filter(Boolean);
-      if (uniqueImages.length) {
-        await appendToLog('IMAGES', rel, '', [], uniqueImages);
-      }
-
-      // 5) Prepend ReadMe YAML FM
-      const readmeYaml = yaml.dump(readmeFM, { lineWidth: 0 });
-      const final = `---\n${readmeYaml}---\n\n${mdxBody}`.trim() + '\n';
-
-      // 6) Always write with .md extension
-      const outRel = rel.replace(/\.(mdx|md)$/i, '.md');
-      const outAbs = path.join(OUT_DIR, outRel);
-      await fs.mkdir(path.dirname(outAbs), { recursive: true });
-      await fs.writeFile(outAbs, final, 'utf8');
-
-      // 7) Optional copy destination
-      if (COPY_DIR) {
-        const copyAbs = path.join(COPY_DIR, outRel);
-        await fs.mkdir(path.dirname(copyAbs), { recursive: true });
-        await fs.writeFile(copyAbs, final, 'utf8');
-      }
-
-      report.files.push({
-        file: rel,
-        output: path.relative(process.cwd(), outAbs),
-        copiedTo: COPY_DIR
-          ? path.relative(process.cwd(), path.join(COPY_DIR, outRel))
-          : null,
-        title: readmeFM.title ?? null,
-        warnings,
-        images: uniqueImages,
-      });
-
-      const w = warnings.length
-        ? pc.yellow(` (${warnings.length} warnings)`)
-        : pc.green(' ✓');
-      console.log(pc.cyan('Converted:'), rel, '→', outRel, w);
-    } catch (err) {
-      failedCount++;
-      console.warn(pc.red(`Failed:`), rel);
-      console.warn(pc.gray(String(err && (err.stack || err.message || err))));
+    // Logging: residual HTML snippets (non-whitelisted ones that we converted)
+    if (strippedHtmlSnippets.length) {
       await appendToLog(
-        'FAILED',
+        LOG_PATH,
+        'STRIPPED_HTML',
         rel,
-        String(err && (err.stack || err.message || err)),
+        strippedHtmlSnippets.join('\n---\n'),
         [],
         []
       );
-      continue;
     }
-  }
+    if (jsRemoved.length) {
+      await appendToLog(LOG_PATH, 'REMOVED_JS', rel, '', jsRemoved, []);
+    }
+    if (mdxRemoved.length) {
+      await appendToLog(LOG_PATH, 'REMOVED_MDX', rel, '', mdxRemoved, []);
+    }
+    const uniqueImages = Array.from(new Set(imageUrls)).filter(Boolean);
+    if (uniqueImages.length) {
+      await appendToLog(LOG_PATH, 'IMAGES', rel, '', [], uniqueImages);
+    }
 
-  // Ensure index.md exists with title = EXACT parent directory name
-  await ensureIndexMdIfMissing(OUT_DIR);
-  if (COPY_DIR) await ensureIndexMdIfMissing(COPY_DIR);
+    // Final doc
+    const final = `---\n${readmeYaml}---\n\n${mdBody}`.trim() + '\n';
 
-  // Update _order.yaml if present (OUT_DIR and COPY_DIR)
-  await updateOrderYamlIfExists(OUT_DIR);
-  if (COPY_DIR) await updateOrderYamlIfExists(COPY_DIR);
+    await fs.mkdir(path.dirname(destAbs), { recursive: true });
+    await fs.writeFile(destAbs, final, 'utf8');
+    if (COPY_ROOT) {
+      await fs.mkdir(path.dirname(copyAbs), { recursive: true });
+      await fs.writeFile(copyAbs, final, 'utf8');
+    }
 
-  const reportPath = path.join(OUT_DIR, 'migration-report.json');
-  await fs.writeFile(reportPath, JSON.stringify(report, null, 2), 'utf8');
+    report.files.push({
+      source: path.relative(SRC_ROOT, absSrc),
+      output: path.relative(DEST_ROOT, destAbs),
+      copiedTo: COPY_ROOT ? path.relative(COPY_ROOT, copyAbs) : null,
+      title: readmeFM.title ?? null,
+      warnings,
+      images: uniqueImages,
+    });
 
-  console.log(pc.magenta(`\nReport: ${reportPath}`));
-  console.log(pc.magenta(`Log:    ${LOG_PATH}`));
-  if (failedCount) {
     console.log(
-      pc.red(`Completed with ${failedCount} failed file(s). See _log.csv.`)
+      pc.cyan('Converted:'),
+      path.relative(SRC_ROOT, absSrc),
+      '→',
+      path.relative(DEST_ROOT, destAbs),
+      pc.green('✓')
     );
-  } else {
-    console.log(pc.green('Completed with no failures.'));
-  }
-})().catch(async err => {
-  try {
+  } catch (err) {
+    failed++;
+    console.warn(pc.red('Failed:'), path.relative(SRC_ROOT, absSrc));
+    console.warn(pc.gray(String(err && (err.stack || err.message || err))));
     await appendToLog(
-      'FATAL',
-      '(script)',
+      LOG_PATH,
+      'FAILED',
+      rel,
       String(err && (err.stack || err.message || err)),
       [],
       []
     );
-  } catch {}
-  console.error(pc.red(err.stack || String(err)));
-  process.exit(1);
-});
+    continue;
+  }
+}
 
-/* ---------------- helpers ---------------- */
+/* ---------------- finalize: index, order, report ---------------- */
+
+await ensureIndexesForCreatedDirs(DEST_ROOT);
+await updateAllOrderYamlIfPresent(DEST_ROOT);
+
+report.completedAt = new Date().toISOString();
+await fs.writeFile(REPORT_PATH, JSON.stringify(report, null, 2), 'utf8');
+
+if (failed) {
+  console.log(pc.red(`\nCompleted with ${failed} failure(s). See _log.csv.`));
+} else {
+  console.log(pc.green('\nCompleted with no failures.'));
+}
+
+/* ================= helpers ================= */
 
 function parseArgs(argv) {
   const out = {};
@@ -332,70 +281,137 @@ function parseArgs(argv) {
   }
   return out;
 }
-function sanitizeDir(name) {
-  return name.replace(/[\\/:*?"<>|]/g, '-').trim() || 'output';
-}
 
-async function loadConfig(p) {
-  if (!p) {
-    return {
-      defaultReadmeFrontmatter: {
-        deprecated: false,
-        hidden: false,
-        metadata: { robots: 'index' },
-      },
-      titleFrom: ['sidebar_label', 'h1'],
-      replacements: [],
-    };
-  }
-  const abs = path.resolve(p);
-  const raw = await fs.readFile(abs, 'utf8');
-  return JSON.parse(raw);
-}
-
-function deriveTitle(customerFM, content, CONFIG) {
-  for (const pref of CONFIG.titleFrom || []) {
-    if (pref === 'sidebar_label' && customerFM.sidebar_label)
-      return String(customerFM.sidebar_label);
-    if (pref === 'title' && customerFM.title) return String(customerFM.title);
-    if (pref === 'h1') {
-      const m = content.match(/^\s*#\s+(.+?)\s*$/m);
-      if (m) return m[1].trim();
-    }
-  }
-  return customerFM.sidebar_label || customerFM.title || 'Untitled';
-}
-
-function buildReadmeFM(customerFM, title, CONFIG) {
-  const base = { title, ...CONFIG.defaultReadmeFrontmatter };
-  const meta = base.metadata || {};
-  if (customerFM.sidebar_position != null)
-    meta.sidebar_position = customerFM.sidebar_position;
-  if (customerFM.sidebar_label) meta.sidebar_label = customerFM.sidebar_label;
-  base.metadata = meta;
-  return base;
-}
-
-// Fix HTML comments and <! ... > sequences that MDX dislikes (mdast stage)
-function mdFixBangAndHtmlComments() {
-  return tree => {
-    visit(tree, node => {
-      if (node.type === 'html' && typeof node.value === 'string') {
-        const v = node.value;
-        if (/^\s*<!--/.test(v) && /-->\s*$/.test(v)) {
-          node.type = 'mdxFlowExpression';
-          node.value = `{/*${v
-            .replace(/^\s*<!--\s*/, '')
-            .replace(/\s*-->\s*$/, '')}*/}`;
-        } else if (/^\s*<![^-]/.test(v)) {
-          node.value = v.replace(/^</, '&lt;'); // escape e.g., <!DOCTYPE>
-        }
-      }
-    });
+function buildReadmeFM(customerFM, title) {
+  return {
+    title,
+    deprecated: false,
+    hidden: false,
+    metadata: { robots: 'index' },
   };
 }
 
-// Collect markdown images (mdast `image` nodes)
+async function findMarkdownFilesRecursive(root, { includeMdx = false } = {}) {
+  const out = [];
+  async function walk(dir) {
+    let dirents;
+    try {
+      dirents = await fs.readdir(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const d of dirents) {
+      const p = path.join(dir, d.name);
+      if (d.isDirectory()) {
+        if (d.name === 'node_modules' || d.name.startsWith('.')) continue;
+        await walk(p);
+      } else if (d.isFile()) {
+        const lower = p.toLowerCase();
+        if (lower.endsWith('.md') || (includeMdx && lower.endsWith('.mdx')))
+          out.push(p);
+      }
+    }
+  }
+  await walk(root);
+  return out;
+}
+
+/* ---------- Pre-pass: :::note / :::tip → <Callout> ---------- */
+
+function convertNoteTipBlocks(text) {
+  const noteRe = /^:::note[^\n]*\n([\s\S]*?)\n:::\s*$/gim;
+  const tipRe = /^:::tip[^\n]*\n([\s\S]*?)\n:::\s*$/gim;
+
+  const toCallout = (inner, kind) => {
+    const body = inner.trim();
+    if (kind === 'note') {
+      return [
+        `<Callout icon="📘" theme="info">`,
+        `  **NOTE**`,
+        ``,
+        indentBlock(body, '  '),
+        `</Callout>`,
+      ].join('\n');
+    } else {
+      return [
+        `<Callout icon="👍" theme="okay">`,
+        `  Tip`,
+        ``,
+        indentBlock(body, '  '),
+        `</Callout>`,
+      ].join('\n');
+    }
+  };
+
+  let out = text.replace(tipRe, (_, inner) => toCallout(inner, 'tip'));
+  out = out.replace(noteRe, (_, inner) => toCallout(inner, 'note'));
+  return out;
+}
+
+function indentBlock(s, pad = '  ') {
+  return String(s)
+    .split(/\r?\n/)
+    .map(line => (line.length ? pad + line : ''))
+    .join('\n');
+}
+
+/* ---------- Post-process Tabs transform (textual) ---------- */
+
+function transformDocusaurusTabsToTarget(markdown) {
+  return markdown.replace(
+    /<Tabs\b([^>]*)>([\s\S]*?)<\/Tabs>/g,
+    (whole, attrs, inner) => {
+      const valuesMatch =
+        attrs && attrs.match(/values\s*=\s*\{\s*\[([\s\S]*?)\]\s*\}/);
+      const valuesSrc = valuesMatch ? valuesMatch[1] : '';
+      const items = (valuesSrc.match(/\{[^}]*\}/g) || []).map(it => {
+        const label = (it.match(/label\s*:\s*(['"])(.*?)\1/) || [])[2] || '';
+        const value = (it.match(/value\s*:\s*(['"])(.*?)\1/) || [])[2] || '';
+        return { label, value };
+      });
+      const labelByValue = new Map(
+        items.map(({ label, value }) => [value, label || value || 'Tab'])
+      );
+
+      const tabs = [];
+      inner.replace(
+        /<TabItem\b([^>]*)>([\s\S]*?)<\/TabItem>/g,
+        (m, tabAttrs, tabBody) => {
+          let value = '';
+          const mVal = tabAttrs && tabAttrs.match(/value\s*=\s*(['"])(.*?)\1/);
+          if (mVal) value = mVal[2];
+          const title = labelByValue.get(value) || value || 'Tab';
+          const body = tabBody.trim();
+          tabs.push(
+            [
+              `  <Tab title="${escapeAttr(title)}">`,
+              indentBlock(body, '   '),
+              `  </Tab>`,
+            ].join('\n')
+          );
+          return m;
+        }
+      );
+
+      if (!tabs.length) {
+        return `<Tabs>\n${inner}\n</Tabs>`;
+      }
+      return [`<Tabs>`, tabs.join('\n\n'), `</Tabs>`].join('\n');
+    }
+  );
+}
+
+function escapeAttr(str) {
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+/* ---------- remark helpers (mdast) ---------- */
+
+// Collect markdown images
 function remarkCollectMarkdownImages({ images = [] } = {}) {
   return tree => {
     visit(tree, 'image', node => {
@@ -406,8 +422,7 @@ function remarkCollectMarkdownImages({ images = [] } = {}) {
   };
 }
 
-// Collect MDX/JSX elements but only if they *look like* components
-// i.e., tag name starts with an uppercase letter (Accordion, Link, Tabs, etc.)
+// Record MDX components that look like components (uppercase start)
 function remarkCollectMdxComponentsComponentLike({ removed = [] } = {}) {
   return tree => {
     visit(tree, node => {
@@ -416,7 +431,7 @@ function remarkCollectMdxComponentsComponentLike({ removed = [] } = {}) {
         node.type === 'mdxJsxTextElement'
       ) {
         const name = node.name || '';
-        if (!/^[A-Z]/.test(name)) return; // skip lowercase 'div', 'span', etc.
+        if (!/^[A-Z]/.test(name)) return;
         const attrs = (node.attributes || [])
           .map(a => {
             if (!a || !a.name) return '';
@@ -442,257 +457,311 @@ function remarkCollectMdxComponentsComponentLike({ removed = [] } = {}) {
   };
 }
 
-// Unwrap neutral containers so nested headings/lists convert to MD cleanly
-function rehypeUnwrapNeutralContainers() {
-  const neutral = new Set(['div', 'section', 'article']);
-  return tree => {
-    visit(tree, 'element', (node, index, parent) => {
-      if (!parent) return;
-      if (neutral.has(node.tagName)) {
-        const children = node.children || [];
-        parent.children.splice(index, 1, ...children);
-      }
-    });
-  };
-}
-
-// Flatten HTML <a> and React <Link> to plain text (keep inner content)
-function rehypeFlattenLinksToText() {
-  return tree => {
-    visit(tree, (node, index, parent) => {
-      if (!parent || index == null) return;
-
-      if (node.type === 'element' && node.tagName === 'a') {
-        const kids = node.children || [];
-        parent.children.splice(index, 1, ...kids);
-        return;
-      }
-      if (
-        (node.type === 'mdxJsxFlowElement' ||
-          node.type === 'mdxJsxTextElement') &&
-        node.name === 'Link'
-      ) {
-        const kids = node.children || [];
-        parent.children.splice(index, 1, ...kids);
-        return;
-      }
-    });
-  };
-}
-
-// Collect <img> sources and src={useBaseUrl("...")} (hast stage)
-function rehypeCollectImgSources({ images = [] } = {}) {
+// Fix MDX-unsafe comments/<!...>
+function mdFixBangAndHtmlComments() {
   return tree => {
     visit(tree, node => {
-      if (node && node.type === 'element' && node.tagName === 'img') {
-        const src = node.properties && node.properties.src;
-        if (typeof src === 'string' && src.trim()) {
-          images.push(src.trim());
-        } else if (
-          src &&
-          typeof src === 'object' &&
-          src.type === 'mdxJsxAttributeValueExpression'
-        ) {
-          const m = /useBaseUrl\(\s*(['"])(.*?)\1\s*\)/.exec(src.value || '');
-          if (m && m[2]) images.push(m[2].trim());
+      if (node.type === 'html' && typeof node.value === 'string') {
+        const v = node.value;
+        if (/^\s*<!--/.test(v) && /-->\s*$/.test(v)) {
+          node.type = 'mdxFlowExpression';
+          node.value = `{/*${v
+            .replace(/^\s*<!--\s*/, '')
+            .replace(/\s*-->\s*$/, '')}*/}`;
+        } else if (/^\s*<![^-]/.test(v)) {
+          node.value = v.replace(/^</, '&lt;');
         }
       }
-      if (
-        (node && node.type === 'mdxJsxFlowElement') ||
-        (node && node.type === 'mdxJsxTextElement')
-      ) {
-        const attrs = node.attributes || [];
-        for (const a of attrs) {
+    });
+  };
+}
+
+// Replace <ImageZoom …> with "**MISSING IMAGE!** /path"
+function remarkReplaceImageZoom({ imageUrls = [] } = {}) {
+  return tree => {
+    visit(tree, (node, index, parent) => {
+      if (!parent) return;
+      if (node.type === 'mdxJsxFlowElement' && node.name === 'ImageZoom') {
+        let foundPath = '';
+        for (const a of node.attributes || []) {
           if (a.name === 'src') {
             if (typeof a.value === 'string') {
-              images.push(a.value.trim());
+              foundPath = a.value.trim();
             } else if (
               a.value &&
-              typeof a.value === 'object' &&
               a.value.type === 'mdxJsxAttributeValueExpression'
             ) {
               const m = /useBaseUrl\(\s*(['"])(.*?)\1\s*\)/.exec(
                 a.value.value || ''
               );
-              if (m && m[2]) images.push(m[2].trim());
+              if (m && m[2]) foundPath = m[2].trim();
             }
           }
         }
+        if (foundPath) imageUrls.push(foundPath);
+        const replacement = {
+          type: 'paragraph',
+          children: [
+            {
+              type: 'strong',
+              children: [{ type: 'text', value: 'MISSING IMAGE!' }],
+            },
+            { type: 'text', value: ` ${foundPath}` },
+          ],
+        };
+        parent.children.splice(index, 1, replacement);
       }
     });
   };
 }
 
-// Strip/replace disallowed JS and warn on risky embeds (hast stage)
-function rehypeDisallowAndReplaceJS({ warnings = [], jsRemoved = [] } = {}) {
+/**
+ * Strip <script>…</script> blocks and remove inline event handlers (onClick=, onChange=, …)
+ * from raw HTML nodes. Record removals in jsRemoved + warnings.
+ */
+function remarkStripScriptsAndHandlers({ jsRemoved = [], warnings = [] } = {}) {
   return tree => {
-    visit(tree, node => {
-      // <script>...</script> or <script src="...">
-      if (node.type === 'element' && node.tagName === 'script') {
-        const hasSrc = node.properties && node.properties.src;
-        const jsCode = extractText(node).trim();
-        if (hasSrc) jsRemoved.push(`SCRIPT SRC: ${node.properties.src}`);
-        if (jsCode) jsRemoved.push(`SCRIPT INLINE CODE:\n${jsCode}`);
-        warnings.push({
-          type: 'script',
-          message: hasSrc
-            ? `Removed <script src="${node.properties.src}"> (not allowed in ReadMe docs)`
-            : 'Removed inline <script> (not allowed in ReadMe docs)',
-        });
-        // Replace with a note (kept minimal, not logged as HTML "removed code")
-        node.type = 'raw';
-        node.value =
-          '\n{/* ❗ Script removed: replace with an MDX component. */}\n';
-        node.tagName = undefined;
-        node.children = undefined;
-        node.properties = undefined;
-        return;
-      }
+    visit(tree, 'html', node => {
+      if (!node || typeof node.value !== 'string') return;
+      let html = node.value;
 
-      // Warn for iframes
-      if (node.type === 'element' && node.tagName === 'iframe') {
-        warnings.push({
-          type: 'iframe',
-          message: 'Found <iframe>. ReadMe may sanitize/block embeds.',
-        });
-      }
-
-      // Remove inline event handlers like onClick, onload, etc. and RECORD them
-      if (node.type === 'element' && node.properties) {
-        const toRemove = [];
-        const removedDetail = [];
-        for (const [k, v] of Object.entries(node.properties)) {
-          if (/^on[A-Z]/.test(k)) {
-            toRemove.push(k);
-            let val = '';
-            if (typeof v === 'string') val = v;
-            else if (Array.isArray(v)) val = v.join(' ');
-            else if (v && typeof v === 'object' && 'value' in v)
-              val = String(v.value || '');
-            removedDetail.push(
-              `${k}=${val ? JSON.stringify(val) : '(handler)'}`
-            );
+      // Remove <script ...>...</script>
+      html = html.replace(
+        /<\s*script\b([^>]*)>([\s\S]*?)<\s*\/\s*script\s*>/gi,
+        (_, attrs, code) => {
+          const srcMatch = attrs && attrs.match(/\bsrc\s*=\s*(['"])(.*?)\1/i);
+          if (srcMatch && srcMatch[2]) {
+            jsRemoved.push(`SCRIPT SRC: ${srcMatch[2]}`);
+            warnings.push({
+              type: 'script',
+              message: `Removed <script src="${srcMatch[2]}">`,
+            });
+          } else if (code && code.trim()) {
+            jsRemoved.push(`SCRIPT INLINE CODE:\n${code.trim()}`);
+            warnings.push({
+              type: 'script',
+              message: 'Removed inline <script>',
+            });
+          } else {
+            warnings.push({ type: 'script', message: 'Removed <script>' });
           }
+          return '\n{/* ❗ Script removed: replace with an MDX component. */}\n';
         }
-        if (toRemove.length) {
-          toRemove.forEach(k => delete node.properties[k]);
-          jsRemoved.push(
-            `INLINE HANDLERS on <${node.tagName}>: ${removedDetail.join(', ')}`
-          );
+      );
+
+      // Remove inline handlers (onClick, onChange, etc.) — keep the tag
+      html = html.replace(
+        /(<[A-Za-z][^>]*?)\s+on[A-Z][A-Za-z]+\s*=\s*(?:"[^"]*"|'[^']*'|\{[^}]*\})/g,
+        (m, start) => {
+          jsRemoved.push(`INLINE HANDLER removed in: ${truncate(start, 80)}`);
           warnings.push({
             type: 'inline-handler',
-            message: `Removed inline handlers (${toRemove.join(', ')}) from <${
-              node.tagName
-            }>`,
+            message: 'Removed inline event handler',
           });
+          return start; // drop the handler attribute
         }
-      }
+      );
+
+      node.value = html;
     });
   };
 }
-function extractText(node) {
-  if (!node || !node.children) return '';
-  let out = '';
-  for (const c of node.children) {
-    if (c.type === 'text') out += c.value;
-    else if (c.children) out += extractText(c);
-  }
-  return out;
-}
-function allTextChildren(node) {
-  const children = [];
-  (node.children || []).forEach(c => {
-    if (c.type === 'text') children.push(c);
-    else if (c.children) children.push(...allTextChildren(c));
-  });
-  return children;
-}
 
-// After HTML→Markdown bridge, remove any leftover 'html' nodes (mdast stage)
-function remarkRemoveResidualHtml({ strips = [] } = {}) {
+// Convert a safe subset of HTML → Markdown, leave tables/JSX untouched.
+// We also surface the raw HTML we touched via recordRaw (for logging parity).
+function remarkConvertSelectedHtmlToMd(options = {}) {
+  const { keepHtmlIf, recordRaw } = options;
   return tree => {
     visit(tree, 'html', (node, index, parent) => {
-      if (!parent) return;
-      const original = String(node.value || '');
-      const text = original.replace(/<[^>]+>/g, ''); // strip tags to plaintext
-      strips.push(original.trim());
-      parent.children[index] = { type: 'text', value: text };
+      if (!parent || index == null) return;
+      const raw = String(node.value || '');
+
+      if (typeof keepHtmlIf === 'function' && keepHtmlIf(raw)) return;
+
+      const html = raw.replace(/\r\n?/g, '\n');
+      let changed = false;
+      let out = html;
+
+      // h1..h6
+      out = out.replace(
+        /<\s*h([1-6])\s*>\s*([\s\S]*?)\s*<\s*\/\s*h\1\s*>\s*/gi,
+        (_, n, inner) => {
+          changed = true;
+          return `${'#'.repeat(Number(n))} ${stripTags(inner).trim()}\n\n`;
+        }
+      );
+
+      // p
+      out = out.replace(
+        /<\s*p\s*>\s*([\s\S]*?)\s*<\s*\/\s*p\s*>\s*/gi,
+        (_, inner) => {
+          changed = true;
+          return `${stripTags(inner).trim()}\n\n`;
+        }
+      );
+
+      // br
+      out = out.replace(/<\s*br\s*\/?\s*>\s*/gi, () => {
+        changed = true;
+        return '  \n';
+      });
+
+      // strong/b
+      out = out.replace(
+        /<\s*(b|strong)\s*>\s*([\s\S]*?)\s*<\s*\/\s*(b|strong)\s*>\s*/gi,
+        (_, _t1, inner) => {
+          changed = true;
+          return `**${stripTags(inner).trim()}**`;
+        }
+      );
+
+      // em/i
+      out = out.replace(
+        /<\s*(i|em)\s*>\s*([\s\S]*?)\s*<\s*\/\s*(i|em)\s*>\s*/gi,
+        (_, _t1, inner) => {
+          changed = true;
+          return `*${stripTags(inner).trim()}*`;
+        }
+      );
+
+      // ul > li
+      out = out.replace(
+        /<\s*ul\s*>\s*([\s\S]*?)\s*<\s*\/\s*ul\s*>\s*/gi,
+        (_, inner) => {
+          const items = Array.from(
+            inner.matchAll(/<\s*li\s*>\s*([\s\S]*?)\s*<\s*\/\s*li\s*>/gi)
+          ).map(m => m[1]);
+          if (!items.length) return _;
+          changed = true;
+          return (
+            items.map(it => `- ${stripTags(it).trim()}`).join('\n') + '\n\n'
+          );
+        }
+      );
+
+      // ol > li
+      out = out.replace(
+        /<\s*ol\s*>\s*([\s\S]*?)\s*<\s*\/\s*ol\s*>\s*/gi,
+        (_, inner) => {
+          const items = Array.from(
+            inner.matchAll(/<\s*li\s*>\s*([\s\S]*?)\s*<\s*\/\s*li\s*>/gi)
+          ).map(m => m[1]);
+          if (!items.length) return _;
+          changed = true;
+          return (
+            items
+              .map((it, i) => `${i + 1}. ${stripTags(it).trim()}`)
+              .join('\n') + '\n\n'
+          );
+        }
+      );
+
+      if (!changed) return;
+      if (typeof recordRaw === 'function') recordRaw(raw);
+
+      parent.children.splice(index, 1, { type: 'text', value: out });
     });
   };
 }
 
-/* ---------- index.md creator ---------- */
-async function ensureIndexMdIfMissing(dir) {
-  const indexPath = path.join(dir, 'index.md');
-  try {
-    await fs.access(indexPath);
-    return; // already exists
-  } catch {}
-
-  // Title = EXACT parent directory name (no transformation)
-  const title = path.basename(dir);
-
-  const fm = {
-    title,
-    deprecated: false,
-    hidden: false,
-    metadata: { robots: 'index' },
-  };
-  const yamlStr = yaml.dump(fm, { lineWidth: 0 });
-  const body = `---\n${yamlStr}---\n`;
-  await fs.writeFile(indexPath, body, 'utf8');
-  console.log(pc.blue(`Created index.md in ${dir} (title: "${title}")`));
+function stripTags(s) {
+  return String(s).replace(/<[^>]+>/g, '');
 }
 
-/* ---------- _order.yaml updater ---------- */
-async function updateOrderYamlIfExists(dir) {
-  const orderPath = path.join(dir, '_order.yaml');
-  try {
-    await fs.access(orderPath); // exists?
-  } catch {
-    return; // do nothing if it doesn't exist
+/* ---------- index + order helpers ---------- */
+
+async function ensureIndexesForCreatedDirs(root) {
+  async function walk(dir) {
+    const indexPath = path.join(dir, 'index.md');
+    try {
+      await fs.access(indexPath);
+    } catch {
+      const fm = {
+        title: path.basename(dir),
+        deprecated: false,
+        hidden: false,
+        metadata: { robots: 'index' },
+      };
+      const yamlStr = yaml.dump(fm, { lineWidth: 0 });
+      await fs.writeFile(indexPath, `---\n${yamlStr}---\n`, 'utf8');
+      console.log(pc.blue(`Created index.md in ${dir} (title: "${fm.title}")`));
+    }
+    const dirents = await fs.readdir(dir, { withFileTypes: true });
+    for (const d of dirents) {
+      if (
+        d.isDirectory() &&
+        !d.name.startsWith('.') &&
+        d.name !== 'node_modules'
+      ) {
+        await walk(path.join(dir, d.name));
+      }
+    }
+  }
+  await walk(root);
+}
+
+async function updateAllOrderYamlIfPresent(root) {
+  async function processDir(dir) {
+    const orderPath = path.join(dir, '_order.yaml');
+    try {
+      await fs.access(orderPath);
+    } catch {
+      return;
+    }
+    const dirents = await fs.readdir(dir, { withFileTypes: true });
+    const items = dirents
+      .filter(d => {
+        const name = d.name;
+        if (name === '_order.yaml') return false;
+        if (name === '_log.csv') return false;
+        if (name === 'migration-report.json') return false;
+        if (name.toLowerCase() === 'index.md') return false;
+        if (name.startsWith('.')) return false;
+        if (name.startsWith('_')) return false;
+        if (d.isDirectory()) return true;
+        if (d.isFile() && path.extname(name).toLowerCase() === '.md')
+          return true;
+        return false;
+      })
+      .map(d => {
+        let base = d.name;
+        if (d.isFile()) base = path.basename(base, path.extname(base));
+        const slug = base.toLowerCase().replace(/\s+/g, '-');
+        return `- ${slug}`;
+      })
+      .sort((a, b) => a.localeCompare(b));
+    const content = items.join('\n') + (items.length ? '\n' : '');
+    await fs.writeFile(orderPath, content, 'utf8');
+    console.log(pc.blue(`Updated _order.yaml in ${dir}`));
   }
 
-  const dirents = await fs.readdir(dir, { withFileTypes: true });
-  const items = dirents
-    .filter(d => {
-      const name = d.name;
-      if (name === '_order.yaml') return false;
-      if (name === '_log.csv') return false;
-      if (name === 'migration-report.json') return false;
-      if (name.toLowerCase() === 'index.md') return false; // exclude index.md from order
-      if (name.startsWith('.')) return false;
-      if (name.startsWith('_')) return false; // skip other underscore files
-      if (d.isDirectory()) return true;
-      if (d.isFile() && path.extname(name).toLowerCase() === '.md') return true;
-      return false;
-    })
-    .map(d => {
-      let base = d.name;
-      if (d.isFile()) base = path.basename(base, path.extname(base));
-      const slug = base.toLowerCase().replace(/\s+/g, '-');
-      return `- ${slug}`;
-    })
-    .sort((a, b) => a.localeCompare(b));
+  async function walk(dir) {
+    await processDir(dir);
+    const dirents = await fs.readdir(dir, { withFileTypes: true });
+    for (const d of dirents) {
+      if (
+        d.isDirectory() &&
+        !d.name.startsWith('.') &&
+        d.name !== 'node_modules'
+      ) {
+        await walk(path.join(dir, d.name));
+      }
+    }
+  }
 
-  const content = items.join('\n') + (items.length ? '\n' : '');
-  await fs.writeFile(orderPath, content, 'utf8');
-  console.log(pc.blue(`Updated _order.yaml in ${dir}`));
+  await walk(root);
 }
 
-/* ---------- CSV logging helpers ---------- */
+/* ---------- CSV logging ---------- */
+
 async function writeLogHeader(logPath) {
   await fs.mkdir(path.dirname(logPath), { recursive: true });
   const header = `Type,File,Error Message,Removed Code,Missing Images\n`;
   await fs.writeFile(logPath, header, 'utf8');
 }
 
-/**
- * Append a row to _log.csv
- * - Only records "Removed Code" that is JS/imports/MDX-components (component-like).
- * - Generic HTML is *not* included in Removed Code (it goes to STRIPPED_HTML/Error Message).
- */
 async function appendToLog(
+  logPath,
   type,
   file,
   errorMsg,
@@ -701,66 +770,45 @@ async function appendToLog(
 ) {
   const safe = val => {
     if (val == null) return '';
-    let s = String(val).replace(/"/g, '""'); // escape quotes
+    let s = String(val).replace(/"/g, '""');
     if (/[",\n]/.test(s)) s = `"${s}"`;
     return s;
   };
-
-  // Filter removed code to only JS/imports/MDX-component-like
   const filteredRemoved = (Array.isArray(removedCodeArr) ? removedCodeArr : [])
     .filter(snippet => {
       if (!snippet) return false;
       const s = String(snippet).trim();
-
-      // Imports
-      if (
-        /^\s*import\s.+from\s+['"].+['"];?\s*$/m.test(s) ||
-        /^\s*import\s*[{*].+['"]\s*;?\s*$/m.test(s)
-      ) {
+      if (/^\s*import\s.+/m.test(s)) return true;
+      if (/^SCRIPT (SRC|INLINE CODE)/.test(s) || /^INLINE HANDLERS/.test(s))
         return true;
-      }
-      // Script markers or inline handler summaries we generate
-      if (/^SCRIPT (SRC|INLINE CODE)/.test(s) || /^INLINE HANDLERS/.test(s)) {
-        return true;
-      }
-      // MDX component-like tags: starts with '<' + Uppercase tag
-      if (/^<\s*[A-Z][A-Za-z0-9]*/.test(s)) {
-        return true;
-      }
-      return false; // drop everything else (likely generic HTML)
+      if (/^INLINE HANDLER removed/.test(s)) return true;
+      if (/^<\s*[A-Z][A-Za-z0-9]*/.test(s)) return true;
+      return false;
     })
     .join('\n---\n');
-
   const imgs = Array.isArray(missingImagesArr)
     ? missingImagesArr.join('\n')
     : '';
   const row = `${safe(type)},${safe(file)},${safe(errorMsg)},${safe(
     filteredRemoved
   )},${safe(imgs)}\n`;
-  await fs.appendFile(LOG_PATH, row, 'utf8');
+  await fs.appendFile(logPath, row, 'utf8');
 }
 
 /* ---------- lightweight text sweep for image URLs ---------- */
+
 function collectInlineImageUrlsFromText(source) {
   const urls = new Set();
-
-  // Markdown image: ![alt](url "title")
   const mdImg = /!\[[^\]]*]\(([^)\s]+)(?:\s+["'][^")]+["'])?\)/g;
-  for (const m of source.matchAll(mdImg)) {
-    if (m[1]) urls.add(m[1].trim());
-  }
-
-  // HTML <img src="..."> or '...'
+  for (const m of source.matchAll(mdImg)) if (m[1]) urls.add(m[1].trim());
   const htmlImg = /<img\b[^>]*\bsrc\s*=\s*["']([^"']+)["'][^>]*>/gi;
-  for (const m of source.matchAll(htmlImg)) {
-    if (m[1]) urls.add(m[1].trim());
-  }
-
-  // Any useBaseUrl("...") or useBaseUrl('...')
+  for (const m of source.matchAll(htmlImg)) if (m[1]) urls.add(m[1].trim());
   const useBase = /useBaseUrl\(\s*(['"])(.*?)\1\s*\)/g;
-  for (const m of source.matchAll(useBase)) {
-    if (m[2]) urls.add(m[2].trim());
-  }
-
+  for (const m of source.matchAll(useBase)) if (m[2]) urls.add(m[2].trim());
   return Array.from(urls);
+}
+
+function truncate(s, n) {
+  s = String(s);
+  return s.length <= n ? s : s.slice(0, n - 1) + '…';
 }
