@@ -1,21 +1,34 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 
+/**
+ * @typedef {Object} ImageIndex
+ * @property {string} root - The root directory where images live (e.g. `/static`).
+ * @property {Map<string,string>} byRelative - Map of relative paths (`/img/foo.png`) → absolute local file paths.
+ * @property {Map<string,string[]>} byBasename - Map of basenames (`foo.png`) → list of absolute local file paths.
+ */
+
+/**
+ * Build an index of images under a root directory (recursively).
+ * Useful for resolving image references like `/img/foo.png` back to disk.
+ *
+ * @param {string} rootDirectory - Absolute path to the root folder containing `img/` and `assets/` directories.
+ * @returns {Promise<ImageIndex>} An index object for fast lookups.
+ */
 export async function buildImageIndex(root, subdirs = ['img', 'assets']) {
   const files = [];
 
-  async function walk(dir) {
+  async function walk(directoryPath) {
     let list;
     try {
-      list = await fs.readdir(dir, { withFileTypes: true });
+      list = await fs.readdir(directoryPath, { withFileTypes: true });
     } catch {
       return;
     }
     for (const d of list) {
-      const p = path.join(dir, d.name);
+      const p = path.join(directoryPath, d.name);
       if (d.isDirectory()) await walk(p);
-      else if (d.isFile() && /\.(png|jpe?g|gif|svg|webp|avif)$/i.test(d.name))
-        files.push(p);
+      else if (d.isFile() && /\.(png|jpe?g|gif|svg|webp|avif)$/i.test(d.name)) files.push(p);
     }
   }
 
@@ -35,10 +48,7 @@ export async function buildImageIndex(root, subdirs = ['img', 'assets']) {
   const byRelFromRoot = new Map();
   const byBasename = new Map();
   for (const abs of files) {
-    const relFromRoot = path
-      .relative(root, abs)
-      .replace(/\\/g, '/')
-      .replace(/^\/+/, '');
+    const relFromRoot = path.relative(root, abs).replace(/\\/g, '/').replace(/^\/+/, '');
     byRelFromRoot.set(relFromRoot, abs);
     const base = path.basename(abs);
     if (!byBasename.has(base)) byBasename.set(base, []);
@@ -47,11 +57,17 @@ export async function buildImageIndex(root, subdirs = ['img', 'assets']) {
   return { root, files, byRelFromRoot, byBasename };
 }
 
+/**
+ * Resolve an image path from a document into a local absolute file path.
+ * Prefers exact relative matches (`/img/foo.png`), falls back to basename search.
+ *
+ * @param {string} originalPath - The path as written in the doc (e.g. `/img/foo.png`).
+ * @param {ImageIndex} index - The index created by `buildImageIndex()`.
+ * @returns {string|null} Absolute path to the local file, or null if not found.
+ */
 export function resolveLocalImageSmart(originalPath, index) {
   if (!originalPath) return '';
-  const relNoLead = String(originalPath)
-    .replace(/\\/g, '/')
-    .replace(/^\/+/, '');
+  const relNoLead = String(originalPath).replace(/\\/g, '/').replace(/^\/+/, '');
 
   const exact = index.byRelFromRoot.get(relNoLead);
   if (exact) return exact;
@@ -67,7 +83,7 @@ export function resolveLocalImageSmart(originalPath, index) {
   const candidates = index.byBasename.get(base) || [];
   if (candidates.length === 1) return candidates[0];
   if (candidates.length > 1) {
-    const scored = candidates.map(abs => ({
+    const scored = candidates.map((abs) => ({
       abs,
       score: longestCommonSuffix(abs.replace(/\\/g, '/'), relNoLead),
     }));

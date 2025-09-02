@@ -1,147 +1,181 @@
 import { indentBlock } from './callouts.mjs';
 
-export function transformDocusaurusTabsToTarget(markdown) {
-  return markdown.replace(/<Tabs\b[\s\S]*?<\/Tabs>/g, whole => {
-    const { arraySrc, openEndIndex } = extractValuesArrayFromTabsOpen(whole);
-    const labelByValue = buildLabelMapFromValuesArray(arraySrc);
+/**
+ * Convert Docusaurus-style Tabs into ReadMe-compatible <Tabs><Tab title="...">…</Tab></Tabs>.
+ * - Supports values=[{label: '…' | JSX, value: '…'}, …]
+ * - Uses <TabItem value="…"> content; resolves title from label (fallback to value).
+ */
+export function transformDocusaurusTabsToTarget(markdownText) {
+  return markdownText.replace(/<Tabs\b[\s\S]*?<\/Tabs>/g, (originalTabsBlock) => {
+    const { valuesArraySource, openingTagEndIndex } =
+      extractValuesArrayFromOpeningTag(originalTabsBlock);
 
-    const innerStart =
-      openEndIndex > -1 ? openEndIndex + 1 : whole.indexOf('>') + 1;
-    const innerEnd = whole.lastIndexOf('</Tabs>');
-    const inner =
-      innerEnd > innerStart ? whole.slice(innerStart, innerEnd) : '';
+    const labelByValue = buildLabelMap(valuesArraySource);
 
-    const tabs = [];
-    inner.replace(
+    const innerStartIndex =
+      openingTagEndIndex > -1 ? openingTagEndIndex + 1 : originalTabsBlock.indexOf('>') + 1;
+    const innerEndIndex = originalTabsBlock.lastIndexOf('</Tabs>');
+    const innerContent =
+      innerEndIndex > innerStartIndex
+        ? originalTabsBlock.slice(innerStartIndex, innerEndIndex)
+        : '';
+
+    const renderedTabs = [];
+    innerContent.replace(
       /<TabItem\b([^>]*)>([\s\S]*?)<\/TabItem>/g,
-      (m, tabAttrs, tabBody) => {
-        const valueAttr = getAttr(tabAttrs, 'value');
-        const rawItemLabel = getAttr(tabAttrs, 'label');
-        const preferred =
-          rawItemLabel || (valueAttr && labelByValue.get(valueAttr)) || '';
-        const title = cleanLabel(preferred, valueAttr || 'Tab');
-        const body = tabBody.trim();
+      (whole, tabItemAttributes, tabItemBody) => {
+        const valueAttr = getAttr(tabItemAttributes, 'value'); // supports "v", 'v', {v}
+        const rawLabel = getAttr(tabItemAttributes, 'label'); // may be JSX
+        const preferredTitleSource = rawLabel || (valueAttr && labelByValue.get(valueAttr)) || '';
+        const title = sanitizeLabel(preferredTitleSource, valueAttr || 'Tab');
+        const body = tabItemBody.trim();
 
-        tabs.push(
+        renderedTabs.push(
           [
-            `  <Tab title="${escapeAttr(title)}">`,
+            `  <Tab title="${escapeHtmlAttribute(title)}">`,
             indentBlock(body, '   '),
             `  </Tab>`,
-          ].join('\n')
+          ].join('\n'),
         );
-        return m;
-      }
+        return whole;
+      },
     );
 
-    if (!tabs.length) return whole;
-    return [`<Tabs>`, tabs.join('\n\n'), `</Tabs>`].join('\n');
+    if (!renderedTabs.length) return originalTabsBlock;
+    return ['<Tabs>', renderedTabs.join('\n\n'), '</Tabs>'].join('\n');
   });
 }
 
-function extractValuesArrayFromTabsOpen(whole) {
-  const start = whole.indexOf('<Tabs');
-  if (start === -1) return { arraySrc: '', openEndIndex: whole.indexOf('>') };
+/**
+ * Pull out the `values={[ ... ]}` from the opening <Tabs ...> tag,
+ * even when labels contain JSX (by balancing braces).
+ */
+function extractValuesArrayFromOpeningTag(tabsBlock) {
+  const openingStart = tabsBlock.indexOf('<Tabs');
+  if (openingStart === -1) {
+    return { valuesArraySource: '', openingTagEndIndex: tabsBlock.indexOf('>') };
+  }
 
-  const valIdx = whole.indexOf('values', start);
-  let openEndIndex = whole.indexOf('>');
-  if (valIdx === -1) return { arraySrc: '', openEndIndex };
+  const valuesIndex = tabsBlock.indexOf('values', openingStart);
+  let openingTagEndIndex = tabsBlock.indexOf('>');
+  if (valuesIndex === -1) return { valuesArraySource: '', openingTagEndIndex };
 
-  const braceStart = whole.indexOf('{', valIdx);
-  if (braceStart === -1) return { arraySrc: '', openEndIndex };
+  const braceStartIndex = tabsBlock.indexOf('{', valuesIndex);
+  if (braceStartIndex === -1) return { valuesArraySource: '', openingTagEndIndex };
 
-  let i = braceStart,
-    depth = 0;
-  for (; i < whole.length; i++) {
-    const ch = whole[i];
+  // Balance the braces after "values="
+  let i = braceStartIndex;
+  let depth = 0;
+  for (; i < tabsBlock.length; i++) {
+    const ch = tabsBlock[i];
     if (ch === '{') depth++;
     else if (ch === '}') {
       depth--;
       if (depth === 0) break;
     }
   }
-  const braceEnd = i;
-  openEndIndex = whole.indexOf('>', braceEnd);
+  const braceEndIndex = i;
 
-  const inside = whole.slice(braceStart + 1, braceEnd);
-  const lb = inside.indexOf('[');
-  const rb = inside.lastIndexOf(']');
-  const arraySrc =
-    lb !== -1 && rb !== -1 && rb > lb ? inside.slice(lb + 1, rb) : inside;
-  return { arraySrc, openEndIndex };
+  // True end of the opening tag is the first '>' after the closing '}'
+  openingTagEndIndex = tabsBlock.indexOf('>', braceEndIndex);
+
+  const insideBraces = tabsBlock.slice(braceStartIndex + 1, braceEndIndex); // typically: [ {…}, {…} ]
+  const leftBracket = insideBraces.indexOf('[');
+  const rightBracket = insideBraces.lastIndexOf(']');
+  const valuesArraySource =
+    leftBracket !== -1 && rightBracket !== -1 && rightBracket > leftBracket
+      ? insideBraces.slice(leftBracket + 1, rightBracket)
+      : insideBraces;
+
+  return { valuesArraySource, openingTagEndIndex };
 }
 
-function buildLabelMapFromValuesArray(arraySrc) {
+/**
+ * Build a map of `value -> label` from the values array source string.
+ * Supports quoted, brace-wrapped, and JSX labels (e.g., <center>Title</center>).
+ */
+function buildLabelMap(valuesArraySource) {
   const map = new Map();
-  const objs = extractTopLevelObjects(arraySrc);
-  for (const objStr of objs) {
+  const objects = extractTopLevelObjects(valuesArraySource);
+
+  for (const objectSource of objects) {
     const value =
-      (/[\s,{]value\s*:\s*(['"])([\s\S]*?)\1/.exec(objStr) || [])[2] ||
-      (/[\s,{]value\s*:\s*\{([\s\S]*?)\}/.exec(objStr) || [])[1] ||
-      (/[\s,{]value\s*:\s*([^\s,}]+)/.exec(objStr) || [])[1] ||
+      (/[\s,{]value\s*:\s*(['"])([\s\S]*?)\1/.exec(objectSource) || [])[2] ||
+      (/[\s,{]value\s*:\s*\{([\s\S]*?)\}/.exec(objectSource) || [])[1] ||
+      (/[\s,{]value\s*:\s*([^\s,}]+)/.exec(objectSource) || [])[1] ||
       '';
 
     if (!value) continue;
 
-    let rawLabel = (/[\s,{]label\s*:\s*(['"])([\s\S]*?)\1/.exec(objStr) ||
-      [])[2];
-    if (!rawLabel)
-      rawLabel = (/[\s,{]label\s*:\s*\{([\s\S]*?)\}/.exec(objStr) || [])[1];
-    if (!rawLabel)
-      rawLabel =
-        (/[\s,{]label\s*:\s*([\s\S]*?)(?:,|})/.exec(objStr) || [])[1] || '';
+    let rawLabel =
+      (/[\s,{]label\s*:\s*(['"])([\s\S]*?)\1/.exec(objectSource) || [])[2] ||
+      (/[\s,{]label\s*:\s*\{([\s\S]*?)\}/.exec(objectSource) || [])[1] ||
+      (/[\s,{]label\s*:\s*([\s\S]*?)(?:,|})/.exec(objectSource) || [])[1] ||
+      '';
 
-    rawLabel = stripWrapping(rawLabel);
-    const label = cleanLabel(rawLabel, value);
-    map.set(value, label);
+    rawLabel = stripWrappingDelimiters(rawLabel);
+    const cleaned = sanitizeLabel(rawLabel, value);
+    map.set(value, cleaned);
   }
+
   return map;
 }
 
-function extractTopLevelObjects(s) {
-  const out = [];
-  let depth = 0,
-    start = -1;
-  for (let i = 0; i < s.length; i++) {
-    const ch = s[i];
+function extractTopLevelObjects(source) {
+  const results = [];
+  let depth = 0;
+  let startIndex = -1;
+
+  for (let i = 0; i < source.length; i++) {
+    const ch = source[i];
     if (ch === '{') {
-      if (depth === 0) start = i;
+      if (depth === 0) startIndex = i;
       depth++;
     } else if (ch === '}') {
       depth--;
-      if (depth === 0 && start >= 0) {
-        out.push(s.slice(start, i + 1));
-        start = -1;
+      if (depth === 0 && startIndex >= 0) {
+        results.push(source.slice(startIndex, i + 1));
+        startIndex = -1;
       }
     }
   }
-  if (!out.length) {
-    const re = /\{[\s\S]*?\}/g;
-    let m;
-    while ((m = re.exec(s)) !== null) out.push(m[0]);
+
+  if (!results.length) {
+    const lax = /\{[\s\S]*?\}/g;
+    let match;
+    while ((match = lax.exec(source)) !== null) results.push(match[0]);
   }
-  return out;
+  return results;
 }
 
-function getAttr(attrs, name) {
-  if (!attrs) return '';
-  let m = new RegExp(`${name}\\s*=\\s*"([^"]*)"`).exec(attrs);
+function getAttr(attributeString, name) {
+  if (!attributeString) return '';
+  let m = new RegExp(`${name}\\s*=\\s*"([^"]*)"`).exec(attributeString);
   if (m) return m[1].trim();
-  m = new RegExp(`${name}\\s*=\\s*'([^']*)'`).exec(attrs);
+  m = new RegExp(`${name}\\s*=\\s*'([^']*)'`).exec(attributeString);
   if (m) return m[1].trim();
-  m = new RegExp(`${name}\\s*=\\s*\\{([\\s\\S]*?)\\}`).exec(attrs);
+  m = new RegExp(`${name}\\s*=\\s*\\{([\\s\\S]*?)\\}`).exec(attributeString);
   if (m) return m[1].trim();
   return '';
 }
 
-function cleanLabel(raw, fallback = '') {
-  const stripped = stripTagsInline(String(raw || '')).trim();
-  return stripped || fallback;
-}
-function stripTagsInline(s) {
-  return String(s).replace(/<[^>]+>/g, '');
+function stripWrappingDelimiters(text) {
+  let s = String(text || '').trim();
+  if (s.startsWith('{') && s.endsWith('}')) s = s.slice(1, -1).trim();
+  if ((s.startsWith("'") && s.endsWith("'")) || (s.startsWith('"') && s.endsWith('"'))) {
+    s = s.slice(1, -1).trim();
+  }
+  return s;
 }
 
-function escapeAttr(str) {
+function sanitizeLabel(raw, fallback = '') {
+  const withoutTags = String(raw || '')
+    .replace(/<[^>]+>/g, '')
+    .trim();
+  return withoutTags || fallback;
+}
+
+function escapeHtmlAttribute(str) {
   return String(str)
     .replace(/&/g, '&amp;')
     .replace(/"/g, '&quot;')

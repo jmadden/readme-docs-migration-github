@@ -2,15 +2,18 @@ import { fetch, FormData, File } from 'undici';
 
 const UPLOAD_CACHE = new Map(); // absLocalPath -> hostedURL
 
+/**
+ * Upload a single image file to ReadMe’s API.
+ *
+ * @param {string} localPath - Absolute path to the local image file.
+ * @param {string} apiKey - ReadMe API key.
+ * @returns {Promise<string>} The hosted image URL returned by ReadMe.
+ */
 export async function uploadImageToReadme(fileAbsPath, apiKey) {
   if (UPLOAD_CACHE.has(fileAbsPath)) return UPLOAD_CACHE.get(fileAbsPath);
 
-  const buf = await (
-    await import('node:fs/promises')
-  ).then(m => m.readFile(fileAbsPath));
-  const filename = (await import('node:path')).then(m =>
-    m.basename(fileAbsPath)
-  );
+  const buf = await (await import('node:fs/promises')).then((m) => m.readFile(fileAbsPath));
+  const filename = (await import('node:path')).then((m) => m.basename(fileAbsPath));
   const name = (await filename).toString();
 
   const form = new FormData();
@@ -38,7 +41,7 @@ export async function uploadImagesForDocSmart(
   originalPaths,
   index,
   apiKey,
-  { appendToLog, logPath, relFile }
+  { appendToLog, logPath, relFile },
 ) {
   const mapping = new Map();
   const uniq = Array.from(new Set(originalPaths.filter(Boolean)));
@@ -48,14 +51,7 @@ export async function uploadImagesForDocSmart(
       const { resolveLocalImageSmart } = await import('./indexer.mjs');
       const abs = resolveLocalImageSmart(orig, index);
       if (!abs) {
-        await appendToLog(
-          logPath,
-          'LOCAL_IMAGE_NOT_FOUND',
-          relFile,
-          '',
-          [],
-          [orig]
-        );
+        await appendToLog(logPath, 'LOCAL_IMAGE_NOT_FOUND', relFile, '', [], [orig]);
         continue;
       }
       const url = await uploadImageToReadme(abs, apiKey);
@@ -67,7 +63,7 @@ export async function uploadImagesForDocSmart(
         relFile,
         String(e?.message || e),
         [],
-        [orig]
+        [orig],
       );
     }
   }
