@@ -45,7 +45,7 @@ This tool is designed to help migrate Markdown documentation from a customer’s
 3. Install dependencies:
 
    ```bash
-   npm install undici gray-matter js-yaml picocolors unified remark-parse remark-gfm remark-mdx remark-frontmatter remark-stringify unist-util-visit
+   npm install
    ```
 
 4. Copy `.env.example` to `.env` and add your ReadMe API key if you plan to use image uploading:
