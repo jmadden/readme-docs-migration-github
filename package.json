@@ -6,15 +6,16 @@
     "convert-to-readme-mdx": "./src/cli.mjs"
   },
   "dependencies": {
+    "dotenv": "^16.4.5",
     "gray-matter": "^4.0.3",
     "js-yaml": "^4.1.0",
     "picocolors": "^1.0.0",
-    "remark-frontmatter": "^4.0.1",
-    "remark-gfm": "^3.0.1",
+    "remark-frontmatter": "^5.0.0",
+    "remark-gfm": "^4.0.0",
     "remark-mdx": "^3.0.1",
     "remark-parse": "^11.0.0",
     "remark-stringify": "^11.0.0",
-    "undici": "^6.19.8",
+    "undici": "^6.21.3",
     "unified": "^11.0.5",
     "unist-util-visit": "^5.0.0"
   }

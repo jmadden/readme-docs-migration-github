@@ -1,6 +1,6 @@
+// src/pipeline.mjs
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import matter from 'gray-matter';
 import yaml from 'js-yaml';
 import pc from 'picocolors';
 
@@ -10,123 +10,179 @@ import remarkGfm from 'remark-gfm';
 import remarkMdx from 'remark-mdx';
 import remarkFrontmatter from 'remark-frontmatter';
 import remarkStringify from 'remark-stringify';
+import matter from 'gray-matter';
+import { visit } from 'unist-util-visit';
 
-import { buildReadmeFM } from './utils/frontmatter.mjs';
-import { findMarkdownFilesRecursive } from './utils/fileops.mjs';
-import { appendToLog, appendImagesManifest } from './utils/logging.mjs';
-
-import { convertNoteTipBlocks } from './transform/callouts.mjs';
-import { transformDocusaurusTabsToTarget } from './transform/tabs.mjs';
-import { remarkConvertSelectedHtmlToMd } from './transform/htmlToMd.mjs';
 import {
-  remarkStripScriptsAndHandlers,
-  mdFixBangAndHtmlComments,
-} from './transform/scriptsAndHandlers.mjs';
-import { remarkReplaceImageZoomWithPlaceholder } from './transform/imageZoom.mjs';
+  findMarkdownFilesRecursive,
+  ensureIndexesForCreatedDirs,
+  updateAllOrderYamlIfPresent,
+} from './utils/fileops.mjs';
+
+import { transformDocusaurusTabsToTarget } from './transform/tabs.mjs';
+import { convertNoteTipBlocks } from './transform/callouts.mjs';
+
 import {
   remarkCollectMarkdownImages,
-  remarkCollectMdxComponentsComponentLike,
-} from './transform/mdxCollect.mjs';
+  remarkReplaceImageZoom,
+  mdFixBangAndHtmlComments,
+  remarkStripScriptsAndHandlers,
+  remarkConvertSelectedHtmlToMd,
+} from './transform/mdastPlugins.mjs';
+
+import { writeLogHeader, appendToLog } from './utils/logging.mjs';
 
 import { buildImageIndex } from './images/indexer.mjs';
-import { uploadImagesForDocSmart } from './images/uploader.mjs';
-import { rewriteAllImageOccurrences } from './images/rewrite.mjs';
 
-export async function runPipeline({
-  args,
-  srcRoot,
-  destRoot,
-  copyRoot,
-  logPath,
-  imagesCsvPath,
-  moveMap,
-  moveDupes,
-  report,
-}) {
-  const INCLUDE_MDX = !!args['include-mdx'];
-  const UPLOAD_IMAGES = !!args['upload-images'];
-  const IMAGES_SRC_ROOT = args['images-src']
-    ? path.resolve(args['images-src'])
-    : null;
-  const README_API_KEY =
-    process.env.README_API_KEY || args['readme-api-key'] || '';
+import { readMoveMapCsv } from './moveMap.mjs';
 
-  let IMAGE_INDEX = null;
-  if (UPLOAD_IMAGES) {
-    if (!IMAGES_SRC_ROOT)
-      console.warn(
-        pc.yellow('UPLOAD_IMAGES is on, but --images-src was not provided.')
-      );
-    else {
-      IMAGE_INDEX = await buildImageIndex(IMAGES_SRC_ROOT, ['img', 'assets']);
-      console.log(
-        pc.gray(
-          `Indexed ${IMAGE_INDEX.files.length} images from ${IMAGES_SRC_ROOT}`
-        )
-      );
-    }
-  }
+/* ========================================================================== */
+/*                              PUBLIC ENTRYPOINT                              */
+/* ========================================================================== */
 
-  const allFiles = await findMarkdownFilesRecursive(srcRoot, {
-    includeMdx: INCLUDE_MDX,
-  });
-  if (!allFiles.length) {
+/**
+ * Run the migration pipeline.
+ *
+ * @param {Object} options
+ * @param {string} options.cwd
+ * @param {string} options.srcRoot
+ * @param {string} options.destRoot
+ * @param {boolean} [options.includeMdx=false]
+ * @param {string|null} [options.copyRoot=null]
+ * @param {string|null} [options.imagesSrc=null]
+ * @param {boolean} [options.uploadImages=false]
+ * @param {string|null} [options.readmeApiKey=null]
+ * @param {string|null} [options.moveMapCsv=null] - CSV: file,destination (destination is a directory path)
+ */
+export async function runPipeline(options) {
+  const {
+    cwd,
+    srcRoot,
+    destRoot,
+    includeMdx = false,
+    copyRoot = null,
+    imagesSrc = null,
+    uploadImages = false,
+    readmeApiKey = null,
+    moveMapCsv = null,
+  } = options;
+
+  await fs.mkdir(destRoot, { recursive: true });
+  if (copyRoot) await fs.mkdir(copyRoot, { recursive: true });
+
+  const logPath = path.join(destRoot, '_log.csv');
+  await writeLogHeader(logPath);
+  const imagesMapPath = path.join(destRoot, 'images-map.csv');
+  await ensureImagesMapHeader(imagesMapPath);
+
+  const report = {
+    startedAt: new Date().toISOString(),
+    cwd,
+    srcRoot,
+    destRoot,
+    copyRoot,
+    imagesSrc,
+    uploadImages,
+    moveMapCsv,
+    files: [],
+  };
+
+  // Read move-map once (no slugify; literal folder names)
+  let moveMap = null;
+  let moveDupes = null;
+  if (moveMapCsv) {
+    const { map, dupes } = await readMoveMapCsv(moveMapCsv, destRoot);
+    moveMap = map;
+    moveDupes = dupes;
     console.log(
-      pc.yellow('No .md files found (use --include-mdx to include .mdx).')
+      pc.gray(`Move-map loaded: ${map.size} entries, ${dupes.size} duplicate filename(s).`),
     );
-    return { failed: 0 };
   }
 
-  let failed = 0;
+  const discovered = await findMarkdownFilesRecursive(srcRoot, { includeMdx });
+  if (!discovered.length) {
+    console.log(pc.yellow('No Markdown files found.'));
+    return report;
+  }
+  console.log(pc.gray(`Found ${discovered.length} file(s).`));
 
-  for (const absSrc of allFiles) {
-    const rel = path.relative(srcRoot, absSrc);
-    const outRel = rel.replace(/\.(md|mdx)$/i, '.md');
-    const defaultDestAbs = path.join(destRoot, outRel);
-    const defaultCopyAbs = copyRoot ? path.join(copyRoot, outRel) : null;
+  let imageIndex = null;
+  if (imagesSrc) {
+    imageIndex = await buildImageIndex(imagesSrc);
+    console.log(pc.gray(`Image index built under ${imagesSrc}`));
+  } else if (uploadImages) {
+    console.log(
+      pc.yellow(
+        'Warning: --upload-images enabled but --images-src not provided; uploads may fail.',
+      ),
+    );
+  }
+
+  let failures = 0;
+
+  for (const absoluteSourcePath of discovered) {
+    const relativeFromSrc = path.relative(srcRoot, absoluteSourcePath);
+
+    // Default output behavior for *unmapped* files:
+    // - If flatOutput = true  → put just the file in destRoot (flat)
+    // - If flatOutput = false → mirror source subfolders under destRoot (mirrored)
+    const defaultRelative = (
+      options.flatOutput ? path.basename(relativeFromSrc) : relativeFromSrc
+    ).replace(/\.(md|mdx)$/i, '.md');
+    const defaultDestAbs = path.join(destRoot, defaultRelative);
+
+    const mirrorDestAbs = copyRoot
+      ? path.join(copyRoot, relativeFromSrc.replace(/\.(md|mdx)$/i, '.md'))
+      : null;
 
     try {
-      const raw = await fs.readFile(absSrc, 'utf8');
+      const rawText = await fs.readFile(absoluteSourcePath, 'utf8');
 
-      // Convert :::note/tip/info first
-      const preCallouts = convertNoteTipBlocks(raw);
+      // Pre-pass: :::note/tip/info → <Callout>
+      const preprocessedText = convertNoteTipBlocks(rawText);
 
-      // Parse FM
-      const fm = matter(preCallouts);
+      // Frontmatter
+      const fm = matter(preprocessedText);
       const customerFM = fm.data ?? {};
-      const content = fm.content ?? '';
+      const bodyContent = fm.content ?? '';
 
-      const title =
+      const derivedTitle =
         customerFM.sidebar_label ||
         customerFM.title ||
-        content.match(/^\s*#\s+(.+?)\s*$/m)?.[1]?.trim() ||
+        bodyContent.match(/^\s*#\s+(.+?)\s*$/m)?.[1]?.trim() ||
         'Untitled';
 
-      const readmeFM = buildReadmeFM(customerFM, title);
-      const readmeYaml = yaml.dump(readmeFM, { lineWidth: 0 });
+      const readmeFrontmatter = buildReadmeFrontmatter(derivedTitle);
+      const readmeYaml = yaml.dump(readmeFrontmatter, { lineWidth: 0 });
 
       const warnings = [];
+      const removedJsSnippets = [];
       const strippedHtmlSnippets = [];
-      const imageUrls = collectInlineImageUrlsFromText(content);
-      const jsRemoved = [];
-      const mdxRemoved = [];
+      const referencedImagePaths = collectInlineImageUrlsFromText(bodyContent);
+      const removedMdxComponents = [];
 
-      const vf = await unified()
+      const processed = await unified()
         .use(remarkParse)
         .use(remarkGfm)
         .use(remarkMdx)
         .use(remarkFrontmatter, ['yaml'])
-        .use(remarkReplaceImageZoomWithPlaceholder, { imageUrls })
-        .use(remarkCollectMarkdownImages, { images: imageUrls })
-        .use(remarkCollectMdxComponentsComponentLike, { removed: mdxRemoved })
+
+        .use(remarkReplaceImageZoom, { imageUrls: referencedImagePaths })
+        .use(remarkCollectMarkdownImages, { images: referencedImagePaths })
+        .use(remarkCollectMdxComponentsComponentLike, {
+          removed: removedMdxComponents,
+        })
         .use(mdFixBangAndHtmlComments)
-        .use(remarkStripScriptsAndHandlers, { jsRemoved, warnings })
+        .use(remarkStripScriptsAndHandlers, {
+          jsRemoved: removedJsSnippets,
+          warnings,
+        })
         .use(remarkConvertSelectedHtmlToMd, {
-          keepHtmlIf: rawHtml =>
+          keepHtmlIf: (rawHtml) =>
             /<\s*(table|thead|tbody|tr|th|td)\b/i.test(rawHtml) ||
             /<\s*(Tabs|Tab|Callout)\b/.test(rawHtml) ||
             /<\s*[A-Z][A-Za-z0-9]*/.test(rawHtml),
-          recordRaw: raw => strippedHtmlSnippets.push(raw.trim()),
+          recordRaw: (raw) => strippedHtmlSnippets.push(raw.trim()),
         })
         .use(remarkStringify, {
           bullet: '-',
@@ -134,161 +190,176 @@ export async function runPipeline({
           listItemIndent: 'one',
           rule: '-',
         })
-        .process(content);
+        .process(bodyContent);
 
-      let mdBody = String(vf);
+      let markdownBody = String(processed);
 
-      // Tabs → Tabs/Tab
-      mdBody = transformDocusaurusTabsToTarget(mdBody);
+      // Tabs post-process
+      markdownBody = transformDocusaurusTabsToTarget(markdownBody);
 
-      // Upload images & rewrite
-      const uniqueImages = Array.from(new Set(imageUrls)).filter(Boolean);
-      if (
-        UPLOAD_IMAGES &&
-        README_API_KEY &&
-        IMAGE_INDEX &&
-        uniqueImages.length
-      ) {
-        const mapping = await uploadImagesForDocSmart(
-          uniqueImages,
-          IMAGE_INDEX,
-          README_API_KEY,
-          {
-            appendToLog,
-            logPath,
-            relFile: rel,
-          }
-        );
-        if (mapping.size) {
-          for (const [origPath, info] of mapping) {
-            await appendImagesManifest(imagesCsvPath, {
-              file: rel,
-              original: origPath,
-              local: info.local || '',
-              url: info.url || '',
-            });
-          }
-          mdBody = rewriteAllImageOccurrences(
-            mdBody,
-            new Map(Array.from(mapping).map(([orig, info]) => [orig, info.url]))
-          );
-        }
-      } else if (uniqueImages.length && !UPLOAD_IMAGES) {
-        await appendToLog(logPath, 'IMAGES', rel, '', [], uniqueImages);
-      }
-
-      // Strip import statements at top
+      // Strip top-of-body imports
       {
         const importRegex = /^(?:\s*import\s.+\n)+/;
-        const m = (mdBody.match(importRegex) || [''])[0];
-        mdBody = mdBody.replace(importRegex, '');
-        if (m && m.trim())
-          await appendToLog(
-            logPath,
-            'REMOVED_IMPORTS',
-            rel,
-            '',
-            [m.trim()],
-            []
-          );
+        const m = (markdownBody.match(importRegex) || [''])[0];
+        markdownBody = markdownBody.replace(importRegex, '');
+        if (m && m.trim()) {
+          await appendToLog(logPath, 'REMOVED_IMPORTS', relativeFromSrc, '', [m.trim()], []);
+        }
       }
 
+      // ---- Replace ALL image mentions with placeholders (manual wiring later) ----
+      markdownBody = replaceAllImagesWithPlaceholder(markdownBody);
+
+      // Log collected info
       if (strippedHtmlSnippets.length) {
         await appendToLog(
           logPath,
           'STRIPPED_HTML',
-          rel,
+          relativeFromSrc,
           strippedHtmlSnippets.join('\n---\n'),
           [],
-          []
+          [],
         );
       }
-      if (jsRemoved.length)
-        await appendToLog(logPath, 'REMOVED_JS', rel, '', jsRemoved, []);
-      if (mdxRemoved.length)
-        await appendToLog(logPath, 'REMOVED_MDX', rel, '', mdxRemoved, []);
+      if (removedJsSnippets.length) {
+        await appendToLog(logPath, 'REMOVED_JS', relativeFromSrc, '', removedJsSnippets, []);
+      }
+      if (removedMdxComponents.length) {
+        await appendToLog(logPath, 'REMOVED_MDX', relativeFromSrc, '', removedMdxComponents, []);
+      }
+      const uniqueImages = Array.from(new Set(referencedImagePaths)).filter(Boolean);
+      if (uniqueImages.length) {
+        await appendToLog(logPath, 'IMAGES', relativeFromSrc, '', [], uniqueImages);
+        await appendImagesMapRows(imagesMapPath, relativeFromSrc, uniqueImages, imageIndex);
+      }
 
-      // Move-map
+      const finalDoc = `---\n${readmeYaml}---\n\n${markdownBody}`.trim() + '\n';
+
+      // ===================== MAPPING LOGIC (NO NEW FOLDERS) =====================
       const outFileName = path.basename(defaultDestAbs);
       const moveKey = outFileName.toLowerCase();
 
-      let destAbs = defaultDestAbs;
-      let copyAbs = defaultCopyAbs;
+      let finalAbsolute = defaultDestAbs;
+      let usedMapping = false;
 
-      if (moveMap && moveMap.has(moveKey)) {
-        if (moveDupes.has(moveKey)) {
-          await appendToLog(
-            logPath,
-            'MOVE_DUPLICATE',
-            rel,
-            `Multiple destinations found for ${outFileName}; not moved.`,
-            [],
-            []
-          );
-        } else {
-          const mappedDir = moveMap.get(moveKey);
-          destAbs = path.join(mappedDir, outFileName);
-          if (copyRoot) {
-            const relFromDest = path.relative(destRoot, destAbs);
-            copyAbs = path.join(copyRoot, relFromDest);
+      if (moveMap && moveMap.has(moveKey) && !(moveDupes && moveDupes.has(moveKey))) {
+        const mappedDir = moveMap.get(moveKey); // absolute string or null
+        if (typeof mappedDir === 'string' && mappedDir.trim()) {
+          // Only use mapping if the directory ALREADY exists and is a directory.
+          try {
+            const st = await fs.stat(mappedDir);
+            if (st.isDirectory()) {
+              finalAbsolute = path.join(mappedDir, outFileName);
+              usedMapping = true;
+            } else {
+              await appendToLog(
+                logPath,
+                'MOVE_DEST_NOT_DIR',
+                relativeFromSrc,
+                `Mapped destination exists but is not a directory: ${mappedDir}`,
+                [],
+                [],
+              );
+            }
+          } catch {
+            // Directory does not exist; do NOT create it. Keep default location.
+            await appendToLog(
+              logPath,
+              'MOVE_DEST_MISSING',
+              relativeFromSrc,
+              `Mapped destination directory not found: ${mappedDir}`,
+              [],
+              [],
+            );
           }
         }
-      }
-
-      const final = `---\n${readmeYaml}---\n\n${mdBody}`.trim() + '\n';
-
-      await fs.mkdir(path.dirname(destAbs), { recursive: true });
-      await fs.writeFile(destAbs, final, 'utf8');
-      if (copyAbs) {
-        await fs.mkdir(path.dirname(copyAbs), { recursive: true });
-        await fs.writeFile(copyAbs, final, 'utf8');
-      }
-
-      if (destAbs !== defaultDestAbs) {
+      } else if (moveMap && moveDupes && moveDupes.has(moveKey)) {
         await appendToLog(
           logPath,
-          'MOVED',
-          rel,
-          `Moved to ${path.relative(destRoot, destAbs)}`,
+          'MOVE_DUPLICATE',
+          relativeFromSrc,
+          `Multiple destinations for ${outFileName}; not moved.`,
           [],
-          []
+          [],
         );
+      }
+      // ========================================================================
+
+      // Write outputs
+      if (usedMapping) {
+        // Do NOT create the mapped folder; we already checked it exists.
+        await fs.writeFile(finalAbsolute, finalDoc, 'utf8');
+      } else {
+        // Default path: mirror source tree under dest, we can create needed folders.
+        await fs.mkdir(path.dirname(finalAbsolute), { recursive: true });
+        await fs.writeFile(finalAbsolute, finalDoc, 'utf8');
+      }
+
+      if (copyRoot) {
+        await fs.mkdir(path.dirname(mirrorDestAbs), { recursive: true });
+        await fs.writeFile(mirrorDestAbs, finalDoc, 'utf8');
       }
 
       report.files.push({
-        source: path.relative(srcRoot, absSrc),
-        output: path.relative(destRoot, destAbs),
-        copiedTo: copyRoot && copyAbs ? path.relative(copyRoot, copyAbs) : null,
-        title: readmeFM.title ?? null,
+        source: relativeFromSrc,
+        output: path.relative(destRoot, finalAbsolute),
+        copiedTo: copyRoot ? path.relative(copyRoot, mirrorDestAbs) : null,
+        title: readmeFrontmatter.title,
         warnings,
         images: uniqueImages,
-        moved: destAbs !== defaultDestAbs,
       });
 
       console.log(
         pc.cyan('Converted:'),
-        path.relative(srcRoot, absSrc),
+        relativeFromSrc,
         '→',
-        path.relative(destRoot, destAbs),
-        pc.green('✓')
+        path.relative(destRoot, finalAbsolute),
+        pc.green('✓'),
       );
     } catch (err) {
-      failed++;
-      console.warn(pc.red('Failed:'), path.relative(srcRoot, absSrc));
+      failures++;
+      console.warn(pc.red('Failed:'), relativeFromSrc);
       console.warn(pc.gray(String(err && (err.stack || err.message || err))));
       await appendToLog(
         logPath,
         'FAILED',
-        rel,
+        relativeFromSrc,
         String(err && (err.stack || err.message || err)),
         [],
-        []
+        [],
       );
       continue;
     }
   }
 
-  return { failed };
+  // Finalization
+  await ensureIndexesForCreatedDirs(destRoot);
+  await updateAllOrderYamlIfPresent(destRoot);
+
+  report.completedAt = new Date().toISOString();
+  const reportPath = path.join(destRoot, 'migration-report.json');
+  await fs.writeFile(reportPath, JSON.stringify(report, null, 2), 'utf8');
+
+  if (failures) {
+    console.log(pc.red(`\nCompleted with ${failures} failure(s). See _log.csv.`));
+  } else {
+    console.log(pc.green('\nCompleted with no failures.'));
+  }
+
+  return report;
+}
+
+/* ========================================================================== */
+/*                                 HELPERS                                    */
+/* ========================================================================== */
+
+function buildReadmeFrontmatter(title) {
+  return {
+    title,
+    deprecated: false,
+    hidden: false,
+    metadata: { robots: 'index' },
+  };
 }
 
 function collectInlineImageUrlsFromText(source) {
@@ -299,7 +370,138 @@ function collectInlineImageUrlsFromText(source) {
   for (const m of source.matchAll(htmlImg)) if (m[1]) urls.add(m[1].trim());
   const useBase = /useBaseUrl\(\s*(['"])(.*?)\1\s*\)/g;
   for (const m of source.matchAll(useBase)) if (m[2]) urls.add(m[2].trim());
-  const placeholder = /<!--IMAGE_PLACEHOLDER:([^>]+)-->/g;
-  for (const m of source.matchAll(placeholder)) if (m[1]) urls.add(m[1].trim());
   return Array.from(urls);
+}
+
+function replaceImageMentions(markdownBody, imageUrlMap) {
+  if (!imageUrlMap || !imageUrlMap.size) return markdownBody;
+  let out = markdownBody;
+
+  out = out.replace(/(\*\*MISSING IMAGE!\*\*)\s+([^\s]+)\s*$/gm, (whole, _label, originalPath) => {
+    const entry = imageUrlMap.get(originalPath);
+    if (!entry || !entry.url) return whole;
+    return `<img src="${entry.url}" />`;
+  });
+
+  out = out.replace(
+    /src=\{\s*useBaseUrl\(\s*(['"])(.*?)\1\s*\)\s*\}/g,
+    (whole, _q, originalPath) => {
+      const entry = imageUrlMap.get(originalPath);
+      if (!entry || !entry.url) return whole;
+      return `src="${entry.url}"`;
+    },
+  );
+
+  out = out.replace(
+    /!\[([^\]]*)]\(([^)\s]+)(?:\s+["'][^")]+["'])?\)/g,
+    (whole, altText, originalPath) => {
+      const entry = imageUrlMap.get(originalPath);
+      if (!entry || !entry.url) return whole;
+      return `![${altText}](${entry.url})`;
+    },
+  );
+
+  return out;
+}
+
+/* ---------------- MDX component collection (for logging only) -------------- */
+function remarkCollectMdxComponentsComponentLike({ removed = [] } = {}) {
+  return (tree) => {
+    visit(tree, (node) => {
+      if (node.type === 'mdxJsxFlowElement' || node.type === 'mdxJsxTextElement') {
+        const name = node.name || '';
+        if (!/^[A-Z]/.test(name)) return;
+        const attrs = (node.attributes || [])
+          .map((a) => {
+            if (!a || !a.name) return '';
+            if (typeof a.value === 'string') return `${a.name}="${a.value}"`;
+            if (
+              a.value &&
+              typeof a.value === 'object' &&
+              a.value.type === 'mdxJsxAttributeValueExpression'
+            ) {
+              return `${a.name}={${a.value.value}}`;
+            }
+            return a.name;
+          })
+          .filter(Boolean)
+          .join(' ');
+        removed.push(`<${name}${attrs ? ' ' + attrs : ''}${node.children?.length ? ' …' : ''}/>`);
+      }
+    });
+  };
+}
+
+/** Replace ALL image mentions with a consistent placeholder. */
+function replaceAllImagesWithPlaceholder(markdownBody) {
+  let out = markdownBody;
+
+  // 1) Markdown images: ![alt](url "title")
+  out = out.replace(
+    /!\[([^\]]*)]\(([^)\s]+)(?:\s+["'][^")]+["'])?\)/g,
+    (_whole, _alt, url) => `**MISSING IMAGE!** ${url}`,
+  );
+
+  // 2) HTML <img src="...">
+  out = out.replace(
+    /<img\b[^>]*\bsrc\s*=\s*["']([^"']+)["'][^>]*>/gi,
+    (_whole, url) => `**MISSING IMAGE!** ${url}`,
+  );
+
+  // 3) Existing ImageZoom placeholder is already "**MISSING IMAGE!** /path" (kept as-is)
+
+  // 4) Docusaurus useBaseUrl() patterns inside src={...}
+  out = out.replace(
+    /src=\{\s*useBaseUrl\(\s*(['"])(.*?)\1\s*\)\s*\}/g,
+    (_whole, _q, url) => `**MISSING IMAGE!** ${url}`,
+  );
+
+  return out;
+}
+
+/** Ensure images-map.csv has a header. */
+async function ensureImagesMapHeader(csvPath) {
+  try {
+    await fs.access(csvPath);
+    return; // already exists
+  } catch {
+    const header = 'File,Image Path,Local Candidate,Note\n';
+    await fs.writeFile(csvPath, header, 'utf8');
+  }
+}
+
+/**
+ * Append rows to images-map.csv for manual wiring later.
+ * - fileRel: doc’s relative path (from src root)
+ * - imagePaths: array of referenced image paths found in the doc
+ * - imageIndex: optional, if provided we’ll try to hint a local absolute match
+ */
+async function appendImagesMapRows(csvPath, fileRel, imagePaths, imageIndex) {
+  const rows = [];
+  for (const p of imagePaths) {
+    const { localAbs, note } = tryResolveLocal(imageIndex, p);
+    rows.push(
+      `${csvSafe(fileRel)},${csvSafe(p)},${csvSafe(localAbs || '')},${csvSafe(note || '')}\n`,
+    );
+  }
+  if (rows.length) {
+    await fs.appendFile(csvPath, rows.join(''), 'utf8');
+  }
+}
+
+function tryResolveLocal(imageIndex, imagePath) {
+  if (!imageIndex) return { localAbs: '', note: 'no imagesSrc index' };
+  try {
+    // optional: lazy import to avoid circular deps
+    // but since we didn’t import resolve helper here, do a simple lookup:
+    const hit = imageIndex.get(imagePath) || imageIndex.get(decodeURIComponent(imagePath));
+    if (hit) return { localAbs: hit, note: 'indexed' };
+  } catch {}
+  return { localAbs: '', note: 'not indexed' };
+}
+
+function csvSafe(v) {
+  if (v == null) return '';
+  let s = String(v).replace(/"/g, '""');
+  return /[",\n]/.test(s) ? `"${s}"` : s;
 }
